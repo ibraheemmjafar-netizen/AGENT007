@@ -1,0 +1,2 @@
+[deploy]
+startCommand = "node buybot.mjs"
