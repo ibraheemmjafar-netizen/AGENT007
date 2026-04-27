@@ -502,12 +502,14 @@ async function poll() {
 }
 
 // ── Admin verification ────────────────────────────────────────────────
-async function isAdmin(chatId, userId) {
+async function isAdmin(chatId, userId, chatType) {
+  // Private chats — always allow (the user is the only one here)
+  if (chatType === 'private') return true;
   try {
     const m = await bot.getChatMember(chatId, userId);
     return ['administrator', 'creator'].includes(m.status);
   } catch {
-    // Can't read member list (bot lacks permission, or private chat) — allow through
+    // Can't read member list — allow through to avoid blocking real admins
     return true;
   }
 }
@@ -526,9 +528,10 @@ const KB_MAIN = {
 };
 
 function kbRemoveList(toks) {
-  const rows = toks.map(t => ([{
+  // Use array index in callback_data — coinTypes exceed Telegram's 64-byte limit
+  const rows = toks.map((t, i) => ([{
     text: `❌ Remove ${t.sym}`,
-    callback_data: `rm:${t.coinType}`,
+    callback_data: `rm:${i}`,
   }]));
   rows.push([{ text: '🏠 Menu', callback_data: 'menu' }]);
   return { inline_keyboard: rows };
@@ -594,9 +597,11 @@ const HELP_ADD_TEXT =
 
 async function handleMsg(msg) {
   if (!msg || !msg.text) return;
-  const chatId = msg.chat.id;
-  const userId = msg.from?.id || null;
-  const text   = (msg.text || '').trim();
+  const chatId   = msg.chat.id;
+  const chatType = msg.chat.type;           // 'private' | 'group' | 'supergroup' | 'channel'
+  const userId   = msg.from?.id || null;
+  // Strip @BotName suffix Telegram appends to commands in groups (/cmd@BotName → /cmd)
+  const text = (msg.text || '').trim().replace(/@\w+/, '');
 
   if (/^\/start/.test(text)) {
     return bot.sendMessage(chatId, startText(), {
@@ -627,14 +632,14 @@ async function handleMsg(msg) {
   }
 
   const addMatch = text.match(/^\/addca\s+(.+)/);
-  if (addMatch) return cmdAddCA(chatId, userId, addMatch[1].trim(), null);
+  if (addMatch) return cmdAddCA(chatId, userId, chatType, addMatch[1].trim(), null);
 
   const remMatch = text.match(/^\/removeca\s+(.+)/);
-  if (remMatch) return cmdRemoveCA(chatId, userId, remMatch[1].trim(), null);
+  if (remMatch) return cmdRemoveCA(chatId, userId, chatType, remMatch[1].trim(), null);
 }
 
-async function cmdAddCA(chatId, userId, ct, msgId) {
-  if (userId !== null && !(await isAdmin(chatId, userId))) {
+async function cmdAddCA(chatId, userId, chatType, ct, msgId) {
+  if (userId !== null && !(await isAdmin(chatId, userId, chatType))) {
     const err = '❌ Only channel/group admins can add tokens.';
     return msgId
       ? bot.editMessageText(err, { chat_id: chatId, message_id: msgId })
@@ -706,8 +711,8 @@ async function cmdAddCA(chatId, userId, ct, msgId) {
   }
 }
 
-async function cmdRemoveCA(chatId, userId, ct, msgId) {
-  if (userId !== null && !(await isAdmin(chatId, userId))) {
+async function cmdRemoveCA(chatId, userId, chatType, ct, msgId) {
+  if (userId !== null && !(await isAdmin(chatId, userId, chatType))) {
     const err = '❌ Only admins can remove tokens.';
     return msgId
       ? bot.editMessageText(err, { chat_id: chatId, message_id: msgId })
@@ -734,10 +739,11 @@ async function cmdRemoveCA(chatId, userId, ct, msgId) {
 
 // ── Inline button callbacks ───────────────────────────────────────────
 async function handleCallback(query) {
-  const chatId  = query.message.chat.id;
-  const msgId   = query.message.message_id;
-  const userId  = query.from?.id || null;
-  const data    = query.data || '';
+  const chatId   = query.message.chat.id;
+  const chatType = query.message.chat.type;
+  const msgId    = query.message.message_id;
+  const userId   = query.from?.id || null;
+  const data     = query.data || '';
 
   // Always acknowledge the tap immediately
   bot.answerCallbackQuery(query.id).catch(() => {});
@@ -778,8 +784,17 @@ async function handleCallback(query) {
   }
 
   if (data.startsWith('rm:')) {
-    const ct = data.slice(3);
-    return cmdRemoveCA(chatId, userId, ct, msgId);
+    // data = 'rm:<index>' — look up the coinType by index to stay under 64-byte limit
+    const idx  = parseInt(data.slice(3), 10);
+    const toks = getTokens(chatId);
+    const tok  = toks[idx];
+    if (!tok) {
+      return bot.editMessageText(
+        `❌ Token not found. The list may have changed — use /listca to refresh.`,
+        { chat_id: chatId, message_id: msgId, reply_markup: kbBack() }
+      );
+    }
+    return cmdRemoveCA(chatId, userId, chatType, tok.coinType, msgId);
   }
 }
 
