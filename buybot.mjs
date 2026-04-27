@@ -506,23 +506,91 @@ async function isAdmin(chatId, userId) {
   try {
     const m = await bot.getChatMember(chatId, userId);
     return ['administrator', 'creator'].includes(m.status);
-  } catch { return false; }
+  } catch {
+    // Can't read member list (bot lacks permission, or private chat) — allow through
+    return true;
+  }
+}
+
+// ── Inline keyboard helpers ───────────────────────────────────────────
+const KB_MAIN = {
+  inline_keyboard: [
+    [
+      { text: '📋 List Tokens',   callback_data: 'list'   },
+      { text: '📊 Status',        callback_data: 'status' },
+    ],
+    [
+      { text: '➕ How to Add a Token', callback_data: 'help_add' },
+    ],
+  ],
+};
+
+function kbRemoveList(toks) {
+  const rows = toks.map(t => ([{
+    text: `❌ Remove ${t.sym}`,
+    callback_data: `rm:${t.coinType}`,
+  }]));
+  rows.push([{ text: '🏠 Menu', callback_data: 'menu' }]);
+  return { inline_keyboard: rows };
+}
+
+function kbBack() {
+  return { inline_keyboard: [[{ text: '🏠 Menu', callback_data: 'menu' }]] };
+}
+
+function kbAfterAdd(chatId) {
+  return {
+    inline_keyboard: [[
+      { text: '📋 List Tokens', callback_data: 'list'   },
+      { text: '🏠 Menu',        callback_data: 'menu'   },
+    ]],
+  };
 }
 
 // ── Command handlers ──────────────────────────────────────────────────
-const HELP_TEXT =
-  `🤖 *Agent 007 Buy Bot*\n\n` +
-  `I post real-time buy alerts to your Telegram channel or group.\n\n` +
-  `*Quick setup:*\n` +
-  `① Add me as *admin* to your channel or group\n` +
-  `② Run \`/addca <coinType>\` in that chat\n` +
-  `③ Buy alerts appear automatically!\n\n` +
-  `*Commands:*\n` +
-  `/addca \`<coinType>\` — track a token\n` +
-  `/removeca \`<coinType>\` — stop tracking\n` +
-  `/listca — show tracked tokens\n` +
-  `/status — bot health check\n\n` +
-  `_Supports AGENT MemeLand tokens (2-hop route) and any SUI-paired token automatically._`;
+function startText() {
+  return (
+    `🤖 *Agent 007 Buy Bot*\n\n` +
+    `Real-time buy alerts for Sui tokens — straight to your group or channel.\n\n` +
+    `*Quick setup:*\n` +
+    `① Add me as *admin* to your group or channel\n` +
+    `② Run \`/addca <coinType>\` in that chat\n` +
+    `③ Live buy alerts appear automatically!\n\n` +
+    `_Supports AGENT MemeLand tokens and any SUI-paired Cetus token._`
+  );
+}
+
+function statusText() {
+  const totalToks  = Object.values(DB.channels).reduce((s, c) => s + (c.tokens?.length || 0), 0);
+  const totalChats = Object.keys(DB.channels).length;
+  return (
+    `🤖 *Agent 007 Buy Bot*\n\n` +
+    `Status:    ✅ Online\n` +
+    `Tracking:  *${totalToks} token(s)* across *${totalChats} chat(s)*\n` +
+    `Poll rate: every ${POLL_MS / 1000}s\n` +
+    `Network:   Sui Mainnet`
+  );
+}
+
+function listText(chatId) {
+  const toks = getTokens(chatId);
+  if (!toks.length) return null;
+  const lines = toks.map((t, i) => {
+    const pair = t.pairType === 'AGENT' ? '🟢 AGENT-paired' : '🔵 SUI-paired';
+    return `${i + 1}. *${t.sym}* — ${pair}\n   \`${t.coinType.slice(0, 50)}${t.coinType.length > 50 ? '…' : ''}\``;
+  }).join('\n\n');
+  return `📋 *Tracked tokens (${toks.length})*\n\n${lines}`;
+}
+
+const HELP_ADD_TEXT =
+  `➕ *How to track a token*\n\n` +
+  `Send this command in your group or channel:\n\n` +
+  `\`/addca <coinType>\`\n\n` +
+  `*Example:*\n` +
+  `\`/addca 0x5613a7e1::agent::AGENT\`\n\n` +
+  `The coin type is the full on-chain identifier for the token — you can find it on SuiScan or the token's page on agent\\.land\n\n` +
+  `To remove a token:\n` +
+  `\`/removeca <coinType>\``;
 
 async function handleMsg(msg) {
   if (!msg || !msg.text) return;
@@ -531,122 +599,119 @@ async function handleMsg(msg) {
   const text   = (msg.text || '').trim();
 
   if (/^\/start/.test(text)) {
-    return bot.sendMessage(chatId, HELP_TEXT, { parse_mode: 'Markdown' });
+    return bot.sendMessage(chatId, startText(), {
+      parse_mode: 'Markdown',
+      reply_markup: KB_MAIN,
+    });
   }
 
   if (/^\/status/.test(text)) {
-    const totalToks = Object.values(DB.channels).reduce((s, c) => s + (c.tokens?.length || 0), 0);
-    const totalChats = Object.keys(DB.channels).length;
-    return bot.sendMessage(chatId,
-      `🤖 *Agent 007 Buy Bot*\n\n` +
-      `Status:    ✅ Online\n` +
-      `Tracking:  *${totalToks} token(s)* in *${totalChats} chat(s)*\n` +
-      `Poll rate: every ${POLL_MS / 1000}s\n` +
-      `Network:   Sui Mainnet`,
-      { parse_mode: 'Markdown' }
-    );
+    return bot.sendMessage(chatId, statusText(), {
+      parse_mode: 'Markdown',
+      reply_markup: kbBack(),
+    });
   }
 
   if (/^\/listca/.test(text)) {
     const toks = getTokens(chatId);
     if (!toks.length) {
       return bot.sendMessage(chatId,
-        '📭 No tokens tracked in this chat.\n\nUse `/addca <coinType>` to start.',
-        { parse_mode: 'Markdown' }
+        `📭 *No tokens tracked here yet.*\n\nUse \`/addca <coinType>\` to start tracking a token.`,
+        { parse_mode: 'Markdown', reply_markup: kbBack() }
       );
     }
-    const lines = toks.map((t, i) => {
-      const pair = t.pairType === 'AGENT' ? '🟢 AGENT-paired' : '🔵 SUI-paired';
-      return `${i + 1}. *${t.sym}* — ${pair}\n   \`${t.coinType.slice(0, 50)}${t.coinType.length > 50 ? '…' : ''}\``;
-    }).join('\n\n');
-    return bot.sendMessage(chatId,
-      `📋 *Tracked tokens (${toks.length})*\n\n${lines}\n\n_Use /removeca <coinType> to remove._`,
-      { parse_mode: 'Markdown' }
-    );
+    return bot.sendMessage(chatId, listText(chatId), {
+      parse_mode: 'Markdown',
+      reply_markup: kbRemoveList(toks),
+    });
   }
 
   const addMatch = text.match(/^\/addca\s+(.+)/);
-  if (addMatch) {
-    return cmdAddCA(chatId, userId, addMatch[1].trim());
-  }
+  if (addMatch) return cmdAddCA(chatId, userId, addMatch[1].trim(), null);
 
   const remMatch = text.match(/^\/removeca\s+(.+)/);
-  if (remMatch) {
-    return cmdRemoveCA(chatId, userId, remMatch[1].trim());
-  }
+  if (remMatch) return cmdRemoveCA(chatId, userId, remMatch[1].trim(), null);
 }
 
-async function cmdAddCA(chatId, userId, ct) {
-  // Admin gate (skip for channel_post events where userId is null)
+async function cmdAddCA(chatId, userId, ct, msgId) {
   if (userId !== null && !(await isAdmin(chatId, userId))) {
-    return bot.sendMessage(chatId, '❌ Only channel/group admins can add tokens.');
+    const err = '❌ Only channel/group admins can add tokens.';
+    return msgId
+      ? bot.editMessageText(err, { chat_id: chatId, message_id: msgId })
+      : bot.sendMessage(chatId, err);
   }
 
-  // Basic format check
   if (!ct.includes('::') || ct.length < 20) {
-    return bot.sendMessage(chatId,
-      `❌ That doesn't look like a valid coin type.\n\nExpected format:\n\`0x<pkg>::<module>::<TYPE>\``,
-      { parse_mode: 'Markdown' }
-    );
+    const err =
+      `❌ *Invalid coin type.*\n\nExpected format:\n\`0x<package>::<module>::<TYPE>\`\n\n` +
+      `Find the coin type on SuiScan or agent\\.land`;
+    return msgId
+      ? bot.editMessageText(err, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' })
+      : bot.sendMessage(chatId, err, { parse_mode: 'Markdown', reply_markup: kbBack() });
   }
 
-  // Duplicate check
   const toks = getTokens(chatId);
   if (toks.find(t => t.coinType.toLowerCase() === ct.toLowerCase())) {
-    return bot.sendMessage(chatId, `⚠️ Already tracking that token in this chat.`);
+    const warn = `⚠️ Already tracking that token in this chat.`;
+    return msgId
+      ? bot.editMessageText(warn, { chat_id: chatId, message_id: msgId, reply_markup: kbBack() })
+      : bot.sendMessage(chatId, warn, { reply_markup: kbBack() });
   }
 
-  const m = await bot.sendMessage(chatId,
-    `⏳ Detecting pool for \`${ct.slice(0, 40)}…\`\n_Checking GeckoTerminal, Cetus, and AGENT backend…_`,
-    { parse_mode: 'Markdown' }
-  );
+  const sent = msgId
+    ? await bot.editMessageText(
+        `⏳ Detecting pool…\n_Checking GeckoTerminal, Cetus, and AGENT backend…_`,
+        { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' }
+      ).catch(() => null)
+    : await bot.sendMessage(chatId,
+        `⏳ Detecting pool for \`${ct.slice(0, 40)}…\`\n_Checking GeckoTerminal, Cetus, and AGENT backend…_`,
+        { parse_mode: 'Markdown' }
+      );
+
+  const editId = sent?.message_id ?? msgId;
 
   try {
     const pool = await findPool(ct);
     if (!pool) throw new Error(
-      `No Cetus pool found for this token.\n` +
-      `It may not be listed on Cetus yet, or the pool has no liquidity.\n` +
-      `For AGENT MemeLand tokens, make sure the pool is live on https://agent.land`
+      `No Cetus pool found for this token\\.\n` +
+      `It may not be listed yet, or the pool has no liquidity\\.\n` +
+      `For AGENT MemeLand tokens make sure the pool is live on agent\\.land`
     );
 
     const meta = await getMeta(ct);
-    const tok = {
-      coinType: ct,
-      sym:      meta.sym,
-      name:     meta.name,
-      dec:      meta.dec,
-      poolId:   pool.poolId,
-      coinA:    pool.coinA,
-      coinB:    pool.coinB,
-      pairType: pool.pairType,
-      addedAt:  Date.now(),
-    };
-    toks.push(tok);
+    toks.push({
+      coinType: ct, sym: meta.sym, name: meta.name, dec: meta.dec,
+      poolId: pool.poolId, coinA: pool.coinA, coinB: pool.coinB,
+      pairType: pool.pairType, addedAt: Date.now(),
+    });
     saveDB();
 
     const pairLabel = pool.pairType === 'AGENT'
-      ? '🟢 TOKEN / AGENT  _(AGENT MemeLand 2-hop: MEME → AGENT → SUI)_'
-      : '🔵 TOKEN / SUI  _(Cetus CLMM direct)_';
+      ? '🟢 TOKEN / AGENT  _(AGENT MemeLand)_'
+      : '🔵 TOKEN / SUI  _(Cetus CLMM)_';
 
     await bot.editMessageText(
-      `✅ *Now tracking ${meta.sym}!*\n\n` +
+      `✅ *Now tracking ${meta.sym}\\!*\n\n` +
       `Token:  *${meta.name}*\n` +
       `Pair:   ${pairLabel}\n` +
       `Pool:   \`${pool.poolId.slice(0, 44)}…\`\n\n` +
-      `🔔 Buy alerts will be posted here in real-time.`,
-      { chat_id: chatId, message_id: m.message_id, parse_mode: 'Markdown' }
+      `🔔 Buy alerts will appear here automatically\\.`,
+      { chat_id: chatId, message_id: editId, parse_mode: 'MarkdownV2', reply_markup: kbAfterAdd(chatId) }
     );
   } catch(e) {
     await bot.editMessageText(
       `❌ *Failed to add token*\n\n${e.message}`,
-      { chat_id: chatId, message_id: m.message_id, parse_mode: 'Markdown' }
+      { chat_id: chatId, message_id: editId, parse_mode: 'Markdown', reply_markup: kbBack() }
     );
   }
 }
 
-async function cmdRemoveCA(chatId, userId, ct) {
+async function cmdRemoveCA(chatId, userId, ct, msgId) {
   if (userId !== null && !(await isAdmin(chatId, userId))) {
-    return bot.sendMessage(chatId, '❌ Only admins can remove tokens.');
+    const err = '❌ Only admins can remove tokens.';
+    return msgId
+      ? bot.editMessageText(err, { chat_id: chatId, message_id: msgId })
+      : bot.sendMessage(chatId, err);
   }
   const toks = getTokens(chatId);
   const norm = ct.toLowerCase();
@@ -654,24 +719,75 @@ async function cmdRemoveCA(chatId, userId, ct) {
     t.coinType.toLowerCase() === norm || t.sym.toLowerCase() === norm
   );
   if (idx === -1) {
-    return bot.sendMessage(chatId,
-      `❌ Not found: \`${ct.slice(0, 50)}\`\n\nUse /listca to see tracked tokens.`,
-      { parse_mode: 'Markdown' }
-    );
+    const err = `❌ Token not found\\. Use /listca to see what's tracked here\\.`;
+    return msgId
+      ? bot.editMessageText(err, { chat_id: chatId, message_id: msgId, parse_mode: 'MarkdownV2', reply_markup: kbBack() })
+      : bot.sendMessage(chatId, err, { parse_mode: 'MarkdownV2', reply_markup: kbBack() });
   }
   const removed = toks.splice(idx, 1)[0];
   saveDB();
-  bot.sendMessage(chatId,
-    `✅ Stopped tracking *${removed.sym}*.`,
-    { parse_mode: 'Markdown' }
-  );
+  const ok = `✅ *Stopped tracking ${removed.sym}\\.*`;
+  return msgId
+    ? bot.editMessageText(ok, { chat_id: chatId, message_id: msgId, parse_mode: 'MarkdownV2', reply_markup: kbBack() })
+    : bot.sendMessage(chatId, ok, { parse_mode: 'MarkdownV2', reply_markup: kbBack() });
+}
+
+// ── Inline button callbacks ───────────────────────────────────────────
+async function handleCallback(query) {
+  const chatId  = query.message.chat.id;
+  const msgId   = query.message.message_id;
+  const userId  = query.from?.id || null;
+  const data    = query.data || '';
+
+  // Always acknowledge the tap immediately
+  bot.answerCallbackQuery(query.id).catch(() => {});
+
+  if (data === 'menu') {
+    return bot.editMessageText(startText(), {
+      chat_id: chatId, message_id: msgId,
+      parse_mode: 'Markdown', reply_markup: KB_MAIN,
+    });
+  }
+
+  if (data === 'status') {
+    return bot.editMessageText(statusText(), {
+      chat_id: chatId, message_id: msgId,
+      parse_mode: 'Markdown', reply_markup: kbBack(),
+    });
+  }
+
+  if (data === 'list') {
+    const toks = getTokens(chatId);
+    if (!toks.length) {
+      return bot.editMessageText(
+        `📭 *No tokens tracked here yet.*\n\nUse \`/addca <coinType>\` to start tracking a token.`,
+        { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: kbBack() }
+      );
+    }
+    return bot.editMessageText(listText(chatId), {
+      chat_id: chatId, message_id: msgId,
+      parse_mode: 'Markdown', reply_markup: kbRemoveList(toks),
+    });
+  }
+
+  if (data === 'help_add') {
+    return bot.editMessageText(HELP_ADD_TEXT, {
+      chat_id: chatId, message_id: msgId,
+      parse_mode: 'MarkdownV2', reply_markup: kbBack(),
+    });
+  }
+
+  if (data.startsWith('rm:')) {
+    const ct = data.slice(3);
+    return cmdRemoveCA(chatId, userId, ct, msgId);
+  }
 }
 
 // ── Telegram listeners ────────────────────────────────────────────────
-// Handle both group messages (msg.from has user) and channel posts (from is null)
-bot.on('message',      handleMsg);
-bot.on('channel_post', handleMsg);
-bot.on('polling_error', e => console.error('Telegram polling error:', e.message));
+bot.on('message',         handleMsg);
+bot.on('channel_post',    handleMsg);
+bot.on('callback_query',  handleCallback);
+bot.on('polling_error',   e => console.error('Telegram polling error:', e.message));
 
 // ── Startup ───────────────────────────────────────────────────────────
 async function main() {
