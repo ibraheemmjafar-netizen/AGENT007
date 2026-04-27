@@ -1,1 +1,1 @@
-{"name":"agent-007-buybot","version":"1.0.0","type":"module","scripts":{"start":"node buybot.mjs"},"engines":{"node":">=18"}}
+{"name":"agent-007-buybot","version":"1.0.0","type":"module","scripts":{"start":"node buybot.mjs"},"engines":{"node":">=18"},"dependencies":{"node-telegram-bot-api":"^0.64.0","@mysten/sui":"^1.0.0"}}
