@@ -232,23 +232,26 @@ let _agentPriceSui = 0.005; // AGENT/SUI — fallback
 let _suiUsd        = 2.50;  // SUI/USD   — fallback
 
 async function refreshPrices() {
-  try {
-    // AGENT price in SUI
-    const d = await jget(`${GECKO}/networks/sui-network/tokens/${encodeURIComponent(AGENT_T)}`);
-    const p = parseFloat(d?.data?.attributes?.price_in_native_currency || 0);
+  // Fetch AGENT price and SUI/USD in parallel
+  const [agentRes, suiRes] = await Promise.allSettled([
+    jget(`${GECKO}/networks/sui-network/tokens/${encodeURIComponent(AGENT_T)}`, 6000),
+    jget(`https://api.coingecko.com/api/v3/simple/price?ids=sui&vs_currencies=usd`, 5000),
+  ]);
+
+  if (agentRes.status === 'fulfilled') {
+    const a = agentRes.value?.data?.attributes || {};
+    const p = parseFloat(a.price_in_native_currency || 0);
     if (p > 0) _agentPriceSui = p;
-    // SUI/USD from same call (native = SUI so price_usd / price_native = SUI/USD)
-    const pUsd = parseFloat(d?.data?.attributes?.price_usd || 0);
-    const pNat = parseFloat(d?.data?.attributes?.price_in_native_currency || 0);
-    if (pUsd > 0 && pNat > 0) _suiUsd = pUsd / pNat;
-  } catch {}
-  // Direct SUI/USD fallback via CoinGecko simple price
-  if (_suiUsd <= 0) {
-    try {
-      const g = await jget(`https://api.coingecko.com/api/v3/simple/price?ids=sui&vs_currencies=usd`, 5000);
-      if (g?.sui?.usd) _suiUsd = g.sui.usd;
-    } catch {}
+    // Derive SUI/USD from AGENT data as a first estimate
+    const pUsd = parseFloat(a.price_usd || 0);
+    if (pUsd > 0 && p > 0) _suiUsd = pUsd / p;
   }
+  // CoinGecko is authoritative for SUI/USD — always override the derived value
+  if (suiRes.status === 'fulfilled') {
+    const price = suiRes.value?.sui?.usd;
+    if (price > 0) _suiUsd = price;
+  }
+  console.log(`💱 Prices refreshed — SUI: $${_suiUsd.toFixed(3)}  AGENT: ${_agentPriceSui.toFixed(6)} SUI`);
 }
 setInterval(refreshPrices, 120_000);
 refreshPrices();
@@ -264,8 +267,9 @@ async function fetchMarketData(tok) {
   if (cached && Date.now() - cached.ts < MKT_TTL) return cached.data;
 
   const data = {
-    priceUsd: 0, priceSui: 0,
-    mcapUsd: 0, vol24Usd: 0, liqUsd: 0,
+    priceUsd: 0, priceSui: 0, priceAgent: 0,
+    mcapUsd: 0, mcapAgent: 0,
+    vol24Usd: 0, liqUsd: 0,
     holders: null,
   };
 
@@ -312,6 +316,13 @@ async function fetchMarketData(tok) {
   if (data.priceSui > 0 && !data.priceUsd) data.priceUsd = data.priceSui * _suiUsd;
   if (data.priceUsd > 0 && !data.priceSui) data.priceSui = data.priceUsd / _suiUsd;
 
+  // For AGENT-paired tokens: express price and MC in AGENT units
+  if (tok.pairType === 'AGENT' && _agentPriceSui > 0) {
+    if (data.priceSui > 0)  data.priceAgent = data.priceSui / _agentPriceSui;
+    if (data.mcapUsd  > 0 && _suiUsd > 0)
+      data.mcapAgent = data.mcapUsd / (_agentPriceSui * _suiUsd);
+  }
+
   _mktCache.set(key, { ts: Date.now(), data });
   return data;
 }
@@ -348,10 +359,17 @@ function fmtUsd(n) {
   return `$${n.toExponential(3)}`;
 }
 
-function fmtPrice(sui, usd) {
+function fmtNative(val, unit = 'SUI') {
+  if (!val || val <= 0) return null;
+  const formatted = val < 0.001 ? val.toExponential(3) : val.toFixed(6);
+  return `${formatted} ${unit}`;
+}
+
+function fmtPrice(native, usd, unit = 'SUI') {
   const parts = [];
-  if (sui  > 0) parts.push(`${sui < 0.001 ? sui.toExponential(3) : sui.toFixed(6)} SUI`);
-  if (usd  > 0) parts.push(fmtUsd(usd));
+  const n = fmtNative(native, unit);
+  if (n)    parts.push(n);
+  if (usd > 0) parts.push(fmtUsd(usd));
   return parts.join('  /  ') || 'n/a';
 }
 
@@ -413,12 +431,22 @@ async function buildAlert(tok, ev) {
   msg += `━━━━━━━━━━━━━━━━━━━━\n`;
 
   // Price
-  if (mkt.priceSui > 0 || mkt.priceUsd > 0) {
-    msg += `💵 *Price:*   \`${fmtPrice(mkt.priceSui, mkt.priceUsd)}\`\n`;
+  if (mkt.priceAgent > 0) {
+    msg += `💵 *Price:*   \`${fmtPrice(mkt.priceAgent, mkt.priceUsd, 'AGENT')}\`\n`;
+  } else if (mkt.priceSui > 0 || mkt.priceUsd > 0) {
+    msg += `💵 *Price:*   \`${fmtPrice(mkt.priceSui, mkt.priceUsd, 'SUI')}\`\n`;
   }
 
   // Market cap
-  if (mkt.mcapUsd > 0) {
+  if (mkt.mcapAgent > 0) {
+    // AGENT-paired: show MC in AGENT with USD in brackets
+    const agentFmt = mkt.mcapAgent >= 1_000_000
+      ? `${(mkt.mcapAgent / 1_000_000).toFixed(2)}M`
+      : mkt.mcapAgent >= 1_000
+        ? `${(mkt.mcapAgent / 1_000).toFixed(1)}K`
+        : mkt.mcapAgent.toFixed(0);
+    msg += `💹 *Mkt Cap:* \`${agentFmt} AGENT\`  _(${fmtUsd(mkt.mcapUsd)})_\n`;
+  } else if (mkt.mcapUsd > 0) {
     msg += `💹 *Mkt Cap:* \`${fmtUsd(mkt.mcapUsd)}\`\n`;
   }
 
