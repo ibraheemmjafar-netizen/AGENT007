@@ -378,7 +378,7 @@ async function buildAlert(tok, ev) {
 
   // ── Build message ──────────────────────────────────────────────────
   let msg =
-    `${glow} *${badge}*\n` +
+    `${glow ? glow + ' ' : ''}*${badge}*\n` +
     `*${tok.sym}*  —  ${tok.name}\n` +
     `${bar}\n` +
     `━━━━━━━━━━━━━━━━━━━━\n`;
@@ -591,7 +591,7 @@ const HELP_ADD_TEXT =
   `\`/addca <coinType>\`\n\n` +
   `*Example:*\n` +
   `\`/addca 0x5613a7e1::agent::AGENT\`\n\n` +
-  `The coin type is the full on-chain identifier for the token — you can find it on SuiScan or the token's page on agent\\.land\n\n` +
+  `The coin type is the full on-chain address for the token. Find it on SuiScan or the token page on agent.land\n\n` +
   `To remove a token:\n` +
   `\`/removeca <coinType>\``;
 
@@ -649,7 +649,7 @@ async function cmdAddCA(chatId, userId, chatType, ct, msgId) {
   if (!ct.includes('::') || ct.length < 20) {
     const err =
       `❌ *Invalid coin type.*\n\nExpected format:\n\`0x<package>::<module>::<TYPE>\`\n\n` +
-      `Find the coin type on SuiScan or agent\\.land`;
+      `Find the coin type on SuiScan or agent.land`;
     return msgId
       ? bot.editMessageText(err, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' })
       : bot.sendMessage(chatId, err, { parse_mode: 'Markdown', reply_markup: kbBack() });
@@ -678,9 +678,9 @@ async function cmdAddCA(chatId, userId, chatType, ct, msgId) {
   try {
     const pool = await findPool(ct);
     if (!pool) throw new Error(
-      `No Cetus pool found for this token\\.\n` +
-      `It may not be listed yet, or the pool has no liquidity\\.\n` +
-      `For AGENT MemeLand tokens make sure the pool is live on agent\\.land`
+      `No Cetus pool found for this token.\n` +
+      `It may not be listed yet, or the pool has no liquidity.\n` +
+      `For AGENT MemeLand tokens make sure the pool is live on agent.land`
     );
 
     const meta = await getMeta(ct);
@@ -692,16 +692,16 @@ async function cmdAddCA(chatId, userId, chatType, ct, msgId) {
     saveDB();
 
     const pairLabel = pool.pairType === 'AGENT'
-      ? '🟢 TOKEN / AGENT  _(AGENT MemeLand)_'
-      : '🔵 TOKEN / SUI  _(Cetus CLMM)_';
+      ? '🟢 TOKEN / AGENT (AGENT MemeLand)'
+      : '🔵 TOKEN / SUI (Cetus CLMM)';
 
     await bot.editMessageText(
-      `✅ *Now tracking ${meta.sym}\\!*\n\n` +
+      `✅ *Now tracking ${meta.sym}!*\n\n` +
       `Token:  *${meta.name}*\n` +
       `Pair:   ${pairLabel}\n` +
       `Pool:   \`${pool.poolId.slice(0, 44)}…\`\n\n` +
-      `🔔 Buy alerts will appear here automatically\\.`,
-      { chat_id: chatId, message_id: editId, parse_mode: 'MarkdownV2', reply_markup: kbAfterAdd(chatId) }
+      `🔔 Buy alerts will appear here automatically.`,
+      { chat_id: chatId, message_id: editId, parse_mode: 'Markdown', reply_markup: kbAfterAdd(chatId) }
     );
   } catch(e) {
     await bot.editMessageText(
@@ -724,17 +724,17 @@ async function cmdRemoveCA(chatId, userId, chatType, ct, msgId) {
     t.coinType.toLowerCase() === norm || t.sym.toLowerCase() === norm
   );
   if (idx === -1) {
-    const err = `❌ Token not found\\. Use /listca to see what's tracked here\\.`;
+    const err = `❌ Token not found. Use /listca to see what's tracked here.`;
     return msgId
-      ? bot.editMessageText(err, { chat_id: chatId, message_id: msgId, parse_mode: 'MarkdownV2', reply_markup: kbBack() })
-      : bot.sendMessage(chatId, err, { parse_mode: 'MarkdownV2', reply_markup: kbBack() });
+      ? bot.editMessageText(err, { chat_id: chatId, message_id: msgId, reply_markup: kbBack() })
+      : bot.sendMessage(chatId, err, { reply_markup: kbBack() });
   }
   const removed = toks.splice(idx, 1)[0];
   saveDB();
-  const ok = `✅ *Stopped tracking ${removed.sym}\\.*`;
+  const ok = `✅ *Stopped tracking ${removed.sym}.*`;
   return msgId
-    ? bot.editMessageText(ok, { chat_id: chatId, message_id: msgId, parse_mode: 'MarkdownV2', reply_markup: kbBack() })
-    : bot.sendMessage(chatId, ok, { parse_mode: 'MarkdownV2', reply_markup: kbBack() });
+    ? bot.editMessageText(ok, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: kbBack() })
+    : bot.sendMessage(chatId, ok, { parse_mode: 'Markdown', reply_markup: kbBack() });
 }
 
 // ── Inline button callbacks ───────────────────────────────────────────
@@ -779,7 +779,7 @@ async function handleCallback(query) {
   if (data === 'help_add') {
     return bot.editMessageText(HELP_ADD_TEXT, {
       chat_id: chatId, message_id: msgId,
-      parse_mode: 'MarkdownV2', reply_markup: kbBack(),
+      parse_mode: 'Markdown', reply_markup: kbBack(),
     });
   }
 
