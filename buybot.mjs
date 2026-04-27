@@ -46,8 +46,25 @@ if (!TG_TOKEN) {
   process.exit(1);
 }
 
+// ── Suppress verbose TLS/socket dumps that blow Railway's log rate limit ──
+// node-telegram-bot-api prints full request objects on network errors; we
+// intercept unhandled rejections and uncaught exceptions to log only the
+// message string, never the giant socket/TLS object.
+process.on('unhandledRejection', (reason) => {
+  const msg = reason instanceof Error ? reason.message : String(reason);
+  if (!msg.includes('ETELEGRAM') && !msg.includes('EFATAL')) return; // ignore TG noise
+  console.error('Unhandled rejection:', msg);
+});
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err.message || err);
+});
+
 const sui = new SuiClient({ url: SUI_RPC });
-const bot = new TelegramBot(TG_TOKEN, { polling: true });
+// request timeout keeps connections from hanging and producing socket dump logs
+const bot = new TelegramBot(TG_TOKEN, {
+  polling: { timeout: 20, limit: 100 },
+  request: { timeout: 30000 },
+});
 
 // ── Database ──────────────────────────────────────────────────────────
 // Schema: { channels: { [chatId]: { tokens: TokenConfig[] } } }
@@ -802,7 +819,7 @@ async function handleCallback(query) {
 bot.on('message',         handleMsg);
 bot.on('channel_post',    handleMsg);
 bot.on('callback_query',  handleCallback);
-bot.on('polling_error',   e => console.error('Telegram polling error:', e.message));
+bot.on('polling_error',   e => console.error('Polling error:', e.code || e.message));
 
 // ── Startup ───────────────────────────────────────────────────────────
 async function main() {
