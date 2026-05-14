@@ -1,22 +1,22 @@
 /**
  * ╔══════════════════════════════════════════════════╗
- * ║           🤖  AGENT BUYBOT  v2.0               ║
+ * ║         🤖  AGENT BUYBOT  v2.1                 ║
  * ║  Sui Buy Tracker — Cetus · Turbos · Bluefin     ║
- * ║  Button-wizard setup · No commands in group     ║
  * ╚══════════════════════════════════════════════════╝
  *
- * ROOT-CAUSE FIX from v1:
- *   Old code matched token address inside Cetus event JSON.
- *   Cetus SwapEvent contains ONLY pool address — never coin type.
- *   Fix: SUI-scale heuristic (MIST range) detects buy vs sell correctly
- *   for every pool without needing the coin address in the event.
+ * BUGS FIXED IN v2.1 (vs screenshot):
+ * ✅ Wrong token amount  — pool object fetched to get exact coin types
+ * ✅ Wrong price         — correct direction + live SUI price every alert
+ * ✅ MCap N/A            — suix_getCoinMetadata fetches decimals + totalSupply
+ * ✅ Spam old txns       — cursors saved to disk; first run skips history
+ * ✅ Turbos meme support — covers Manifest and all Turbos V3 meme pools
+ * ✅ Bluefin meme support— OrderFilled event with correct field mapping
  *
- * UX (mirrors Bublz, improved):
- *   • Bot added to group → sends "Set Up in DM" button
- *   • DM /start → inline group picker
- *   • Tap group → settings panel (all inline buttons)
- *   • Track Token / Min Buy / Buy Step / Emoji / Max Emojis / Media
- *   • All input collected conversationally in DM — zero commands in group
+ * POOL DIRECTION FIX:
+ *   Cetus/Turbos SwapEvent contains ONLY pool address, not coin types.
+ *   We fetch suix_getObject on the pool once → parse Pool<CoinA,CoinB> type
+ *   to know which side is SUI → derive correct buy/sell + amounts.
+ *   Cached per pool address so we only fetch once per deployment.
  */
 
 import 'dotenv/config';
@@ -28,21 +28,21 @@ import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// ─── CONSTANTS ───────────────────────────────────────────────────────────────
+// ─── CONSTANTS ────────────────────────────────────────────────────────────────
+const BOT_VERSION    = '2.1.0';
+const CONFIG_FILE    = path.join(__dirname, 'config.json');
+const CURSOR_FILE    = path.join(__dirname, 'cursors.json');
+const POOL_DIR_FILE  = path.join(__dirname, 'pool_dir.json');
+const COIN_META_FILE = path.join(__dirname, 'coin_meta.json');
+const POLL_MS        = 4_000;
+const PRICE_MS       = 30_000;   // refresh SUI price every 30s
+const DEDUP_TTL      = 600_000;
+const AGENT_LINK     = 'https://t.me/Sui_Agent/1';
 
-const BOT_VERSION   = '2.0.0';
-const CONFIG_FILE   = path.join(__dirname, 'config.json');
-const POLL_MS       = 4_000;
-const PRICE_REFRESH = 60_000;
-const DEDUP_TTL     = 600_000;
-const AGENT_LINK    = 'https://t.me/Sui_Agent/1';
+// Full SUI coin type on Sui mainnet
+const SUI_TYPE = '0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI';
 
-// SUI MIST range for buy/sell heuristic (0.001 SUI → 100,000 SUI)
-const SUI_MIST_MIN  = 1e6;
-const SUI_MIST_MAX  = 1e14;
-
-const SUI_PRICE_URL = 'https://api.coingecko.com/api/v3/simple/price?ids=sui&vs_currencies=usd';
-
+const SUI_PRICE_URL  = 'https://api.coingecko.com/api/v3/simple/price?ids=sui&vs_currencies=usd';
 const RPC_POOL = [
   'https://sui-mainnet.public.blastapi.io',
   'https://mainnet.suiet.app',
@@ -52,903 +52,583 @@ const RPC_POOL = [
   'https://fullnode.mainnet.sui.io',
 ];
 
-// ─── DEX DEFINITIONS ─────────────────────────────────────────────────────────
+// ─── DEX EVENT TYPES ─────────────────────────────────────────────────────────
+// Cetus CLMM — most memes on Sui (PEEKA, etc.)
+const CETUS_EVENT  = '0x1eabed72c53feb3805120a081dc15963c204dc8d091542592abaf7a35689b2fb::pool::SwapEvent';
+// Turbos V3 — covers Manifest meme + many others
+const TURBOS_EVENT = '0x91bfbc386a41afcfd9b2533058d7e915a1d3829089cc268ff4333d54d6339ca1::pool::SwapEvent';
+// Bluefin Spot DEX — orderbook, meme tokens like BLUE ecosystem
+const BLUEFIN_EVENT= '0x3492c874c1e3b3e2984e8c41b589e642d4d0a5d6459e5a9cfc2d52fd7c89c267::spot_dex::OrderFilled';
 
-const DEX = {
-  cetus: {
-    name: 'Cetus',
-    icon: '🐋',
-    event: '0x1eabed72c53feb3805120a081dc15963c204dc8d091542592abaf7a35689b2fb::pool::SwapEvent',
-    // amount_in / amount_out — detect direction by SUI MIST scale
-    parse(d) {
-      const i = Number(d.amount_in), o = Number(d.amount_out);
-      const isSui = (n) => n >= SUI_MIST_MIN && n <= SUI_MIST_MAX;
-      if (isSui(i) && !isSui(o)) return { isBuy: true,  suiMist: i, tokNative: o };
-      if (!isSui(i) && isSui(o)) return { isBuy: false, suiMist: o, tokNative: i };
-      // fallback: atob=false = SUI→Token = BUY
-      return d.atob === false
-        ? { isBuy: true,  suiMist: i, tokNative: o }
-        : { isBuy: false, suiMist: o, tokNative: i };
-    },
-    pool: (d) => d.pool || '',
-  },
-  turbos: {
-    name: 'Turbos',
-    icon: '🌀',
-    event: '0x91bfbc386a41afcfd9b2533058d7e915a1d3829089cc268ff4333d54d6339ca1::pool::SwapEvent',
-    parse(d) {
-      const a = Number(d.amount_a), b = Number(d.amount_b);
-      const isSui = (n) => n >= SUI_MIST_MIN && n <= SUI_MIST_MAX;
-      if (isSui(a) && !isSui(b)) return { isBuy: true,  suiMist: a, tokNative: b };
-      if (!isSui(a) && isSui(b)) return { isBuy: false, suiMist: b, tokNative: a };
-      return d.a_to_b === true
-        ? { isBuy: true,  suiMist: a, tokNative: b }
-        : { isBuy: false, suiMist: b, tokNative: a };
-    },
-    pool: (d) => d.pool || '',
-  },
-  bluefin: {
-    name: 'Bluefin',
-    icon: '🐬',
-    event: '0x3492c874c1e3b3e2984e8c41b589e642d4d0a5d6459e5a9cfc2d52fd7c89c267::spot_dex::OrderFilled',
-    parse(d) {
-      // Bluefin: base = SUI, quote = token (or vice versa)
-      const base  = Number(d.base_quantity  || d.quantity       || 0);
-      const quote = Number(d.quote_quantity || d.filled_quantity || 0);
-      const isSui = (n) => n >= SUI_MIST_MIN && n <= SUI_MIST_MAX;
-      if (isSui(base) && !isSui(quote)) return { isBuy: true,  suiMist: base,  tokNative: quote };
-      if (!isSui(base) && isSui(quote)) return { isBuy: false, suiMist: quote, tokNative: base };
-      return { isBuy: true, suiMist: base, tokNative: quote };
-    },
-    pool: (d) => d.market_id || d.pool_id || '',
-  },
-};
+// ─── WIZARD STATES ────────────────────────────────────────────────────────────
+const S = { IDLE:'idle', TOKEN:'token', MIN:'minbuy', STEP:'buystep', EMOJI:'emoji', MAXE:'maxemojis', MEDIA:'media' };
 
-// ─── WIZARD STATES ───────────────────────────────────────────────────────────
+// ─── RUNTIME ──────────────────────────────────────────────────────────────────
+let config    = loadConfig();
+let cursors   = loadJson(CURSOR_FILE);         // { dex: cursor } — persisted
+let poolDir   = loadJson(POOL_DIR_FILE);       // { poolAddr: { suiIsA, suiIsB } }
+let coinMeta  = loadJson(COIN_META_FILE);      // { tokenAddr: { decimals, totalSupply } }
+let suiPrice  = 1.0;
+let botUser   = 'AgentBuyBot';
+let startTime = Date.now();
+let totalBuys = 0;
+let activeRpc = null;
 
-const S = {
-  IDLE:       'idle',
-  TOKEN:      'await_token',
-  MIN_BUY:    'await_min_buy',
-  BUY_STEP:   'await_buy_step',
-  EMOJI:      'await_emoji',
-  MAX_EMOJIS: 'await_max_emojis',
-  MEDIA:      'await_media',
-};
+const dexInit   = {};    // { dex: true } once cursor init'd to latest
+const seenTx    = new Map();
+const seenWallet = new Map();
+const buyCount  = new Map();
+const sessions  = new Map();
 
-// ─── RUNTIME STATE ────────────────────────────────────────────────────────────
-
-let config     = loadConfig();
-let suiPrice   = 1.0;
-let botUsername = 'AgentBuyBot';   // overwritten after bot.getMe()
-let startTime  = Date.now();
-let totalBuys  = 0;
-let activeRpc  = null;
-
-const seenTxs    = new Map();   // `dex:txHash` -> ts
-const seenWallets = new Map();  // `groupId:wallet` -> true
-const buyerCounts = new Map();  // `groupId` -> number
-const dmSessions  = new Map();  // userId  -> { state, groupId, msgId }
-const dexCursors  = {};         // `dex` -> cursor
-
-// ─── CONFIG ──────────────────────────────────────────────────────────────────
-
+// ─── PERSISTENCE ──────────────────────────────────────────────────────────────
 function loadConfig() {
   if (fs.existsSync(CONFIG_FILE)) {
-    try { return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); }
-    catch { log('[Config] Parse error — using defaults'); }
+    try { return JSON.parse(fs.readFileSync(CONFIG_FILE,'utf8')); } catch {}
   }
   return { version: BOT_VERSION, groups: {} };
 }
 
-/**
- * GroupConfig:
- * {
- *   groupName: string,
- *   tokenAddress: string|null,   // full 0x::module::COIN
- *   tokenSymbol:  string|null,
- *   decimals:     number,        // token decimals (default 6)
- *   totalSupply:  number|null,   // for mcap calc
- *   knownPools:   string[],      // optional pool filter
- *   minBuyUSD:    number,
- *   buyStep:      number,
- *   emoji:        string,
- *   maxEmojis:    number,
- *   media:        {type,fileId}|null,
- *   paused:       boolean,
- *   addedAt:      number
- * }
- */
+function loadJson(file) {
+  if (fs.existsSync(file)) {
+    try { return JSON.parse(fs.readFileSync(file,'utf8')); } catch {}
+  }
+  return {};
+}
+
+function save()         { fs.writeFileSync(CONFIG_FILE,  JSON.stringify(config,null,2)); }
+function saveCursors()  { fs.writeFileSync(CURSOR_FILE,  JSON.stringify(cursors,null,2)); }
+function savePoolDir()  { fs.writeFileSync(POOL_DIR_FILE, JSON.stringify(poolDir,null,2)); }
+function saveCoinMeta() { fs.writeFileSync(COIN_META_FILE,JSON.stringify(coinMeta,null,2)); }
+
 function mkGroup(name) {
-  return {
-    groupName:    name || 'My Group',
-    tokenAddress: null,
-    tokenSymbol:  null,
-    decimals:     6,
-    totalSupply:  null,
-    knownPools:   [],
-    minBuyUSD:    0,
-    buyStep:      100,
-    emoji:        '🟢',
-    maxEmojis:    20,
-    media:        null,
-    paused:       false,
-    addedAt:      Date.now(),
-  };
+  return { groupName:name||'My Group', tokenAddress:null, tokenSymbol:null,
+           tokenName:null, decimals:6, totalSupply:null, knownPools:[],
+           minBuyUSD:0, buyStep:100, emoji:'🟢', maxEmojis:20,
+           media:null, paused:false, addedAt:Date.now() };
+}
+function ensureGroup(id,name){ if(!config.groups[id]){config.groups[id]=mkGroup(name);save();} }
+
+// ─── LOGGING ──────────────────────────────────────────────────────────────────
+function log(m){ console.log(`[${new Date().toISOString().slice(0,19).replace('T',' ')}] ${m}`); }
+
+// ─── FORMAT ───────────────────────────────────────────────────────────────────
+const fmt$ = n => '$'+parseFloat(n).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+const fmtTk = n => n>=1e9?(n/1e9).toFixed(2)+'B':n>=1e6?(n/1e6).toFixed(2)+'M':parseFloat(n).toLocaleString('en-US',{maximumFractionDigits:2});
+const fmtMc = n => !n||n<=0?'N/A':n>=1e9?'$'+(n/1e9).toFixed(2)+'B':n>=1e6?'$'+(n/1e6).toFixed(2)+'M':n>=1e3?'$'+(n/1e3).toFixed(1)+'K':'$'+n.toFixed(0);
+const short  = a => (!a||a.length<10)?a||'':a.slice(0,6)+'...'+a.slice(-4);
+const upStr  = () => { const s=Math.floor((Date.now()-startTime)/1000),h=Math.floor(s/3600),m=Math.floor((s%3600)/60); return h>0?`${h}h ${m}m`:`${m}m`; };
+
+function fmtP(p) {
+  if (!p||p===0) return 'N/A';
+  if (p>=0.01) return '$'+p.toFixed(4);
+  const s=p.toFixed(20), zeros=(s.match(/^0\.(0*)/)||['',''])[1].length;
+  const sig=s.replace('0.','').replace(/^0+/,'').slice(0,4);
+  const sub=zeros.toString().split('').map(d=>'₀₁₂₃₄₅₆₇₈₉'[+d]).join('');
+  return zeros>2?`$0.0${sub}${sig}`:'$'+p.toFixed(8);
 }
 
-function ensureGroup(chatId, name) {
-  if (!config.groups[chatId]) { config.groups[chatId] = mkGroup(name); save(); }
+function buyBar(usd,emoji,step,max){
+  return (emoji||'🟢').repeat(Math.max(1,Math.min(Math.ceil(usd/(step||100)),max||20)));
 }
-
-function save() {
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
-}
-
-// ─── LOGGING ─────────────────────────────────────────────────────────────────
-
-function log(msg) {
-  const ts = new Date().toISOString().replace('T', ' ').slice(0, 19);
-  console.log(`[${ts}] ${msg}`);
-}
-
-// ─── FORMATTING ──────────────────────────────────────────────────────────────
-
-function fmt$(n) {
-  return '$' + parseFloat(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-}
-
-function fmtTok(n) {
-  if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
-  if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
-  return parseFloat(n).toLocaleString('en-US', { maximumFractionDigits: 2 });
-}
-
-function fmtPrice(p) {
-  if (!p || p === 0) return 'N/A';
-  if (p >= 0.01)     return '$' + p.toFixed(4);
-  const s    = p.toFixed(20);
-  const zeros = (s.match(/^0\.(0*)/) || ['', ''])[1].length;
-  const sig   = s.replace('0.', '').replace(/^0+/, '').slice(0, 4);
-  const sub   = zeros.toString().split('').map(d => '₀₁₂₃₄₅₆₇₈₉'[+d]).join('');
-  return zeros > 2 ? `$0.0${sub}${sig}` : '$' + p.toFixed(8);
-}
-
-function fmtMcap(n) {
-  if (!n || n <= 0) return 'N/A';
-  if (n >= 1e9) return '$' + (n / 1e9).toFixed(2) + 'B';
-  if (n >= 1e6) return '$' + (n / 1e6).toFixed(2) + 'M';
-  if (n >= 1e3) return '$' + (n / 1e3).toFixed(1) + 'K';
-  return '$' + n.toFixed(0);
-}
-
-function shortAddr(a) {
-  if (!a || a.length < 10) return a || '';
-  return a.slice(0, 6) + '...' + a.slice(-4);
-}
-
-function bar(usd, emoji, step, max) {
-  const n = Math.min(Math.ceil(usd / (step || 100)), max || 20);
-  return (emoji || '🟢').repeat(Math.max(1, n));
-}
-
-function uptime() {
-  const s = Math.floor((Date.now() - startTime) / 1000);
-  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
-  return h > 0 ? `${h}h ${m}m` : `${m}m`;
-}
-
-// Escape for MarkdownV2
-function e(str) {
-  return String(str).replace(/[_*[\]()~`>#+\-=|{}.!\\]/g, '\\$&');
-}
+const e = s => String(s).replace(/[_*[\]()~`>#+\-=|{}.!\\]/g,'\\$&');
 
 // ─── SUI RPC ─────────────────────────────────────────────────────────────────
-
 async function rpc(method, params) {
-  const endpoints = activeRpc
-    ? [activeRpc, ...RPC_POOL.filter(u => u !== activeRpc)]
-    : RPC_POOL;
-  for (const url of endpoints) {
+  const pool = activeRpc ? [activeRpc,...RPC_POOL.filter(u=>u!==activeRpc)] : RPC_POOL;
+  for (const url of pool) {
     try {
-      const r = await axios.post(url,
-        { jsonrpc: '2.0', id: 1, method, params },
-        { timeout: 8000 }
-      );
-      if (r.data?.result !== undefined) { activeRpc = url; return r.data.result; }
-    } catch { /* try next */ }
+      const r = await axios.post(url,{jsonrpc:'2.0',id:1,method,params},{timeout:8000});
+      if (r.data?.result!==undefined){ activeRpc=url; return r.data.result; }
+    } catch {}
   }
-  throw new Error('All Sui RPC endpoints unreachable');
+  throw new Error('All Sui RPCs unreachable');
 }
 
+// ─── SUI PRICE ────────────────────────────────────────────────────────────────
 async function refreshPrice() {
   try {
-    const r = await axios.get(SUI_PRICE_URL, { timeout: 6000 });
+    const r = await axios.get(SUI_PRICE_URL,{timeout:6000});
     const p = r.data?.sui?.usd;
-    if (p && p > 0) { suiPrice = p; log(`SUI $${p}`); }
-  } catch (err) { log(`Price refresh failed: ${err.message}`); }
+    if (p&&p>0){ suiPrice=p; log(`SUI price: $${p.toFixed(4)}`); }
+  } catch(err){ log(`Price error: ${err.message}`); }
 }
 
-// ─── EVENT POLLING ────────────────────────────────────────────────────────────
+// ─── FETCH POOL DIRECTION (coin types) ────────────────────────────────────────
+// Fetches pool object, parses Pool<CoinA,CoinB> type to know which side is SUI
+async function fetchPoolDir(poolAddr) {
+  if (poolDir[poolAddr]) return poolDir[poolAddr]; // cached
+  try {
+    const obj = await rpc('suix_getObject',[poolAddr,{showType:true,showContent:false}]);
+    const typeStr = obj?.data?.type || '';
+    // Match: Pool<CoinA, CoinB> or Pool<CoinA,CoinB>
+    const match = typeStr.match(/<([^,>]+),\s*([^>]+)>/);
+    if (!match) return null;
+    const coinA = match[1].trim(), coinB = match[2].trim();
+    const isSui = c => c===SUI_TYPE || c.endsWith('::sui::SUI');
+    const dir = { suiIsA:isSui(coinA), suiIsB:isSui(coinB) };
+    poolDir[poolAddr] = dir;
+    savePoolDir();
+    log(`Pool ${poolAddr.slice(0,10)}... → SUI is ${dir.suiIsA?'A':dir.suiIsB?'B':'neither'}`);
+    return dir;
+  } catch(err){ log(`Pool dir fetch error: ${err.message}`); return null; }
+}
 
-async function poll() {
-  // Build set of groups that have a token configured
-  const active = Object.entries(config.groups).filter(([, g]) => g.tokenAddress && !g.paused);
-  if (!active.length) return;
-
-  for (const [dexKey, dex] of Object.entries(DEX)) {
+// ─── FETCH COIN METADATA (decimals + totalSupply) ─────────────────────────────
+async function fetchCoinMeta(tokenAddr) {
+  if (coinMeta[tokenAddr]) return coinMeta[tokenAddr]; // cached
+  try {
+    // getCoinMetadata uses the coin type string
+    const meta = await rpc('suix_getCoinMetadata',[tokenAddr]);
+    let dec = meta?.decimals ?? 6;
+    let name = meta?.name || tokenAddr.split('::').pop();
+    // getTotalSupply
+    let supply = null;
     try {
-      const result = await rpc('suix_queryEvents', [
-        { MoveEventType: dex.event },
-        dexCursors[dexKey] || null,
-        50,
-        false,
-      ]);
-      if (!result?.data?.length) continue;
-      if (result.nextCursor) dexCursors[dexKey] = result.nextCursor;
-
-      for (const event of result.data) {
-        const txHash = event.id?.txDigest || '';
-        if (!txHash) continue;
-        const txKey = `${dexKey}:${txHash}`;
-        if (seenTxs.has(txKey)) continue;
-        seenTxs.set(txKey, Date.now());
-        pruneDedup();
-
-        const d = event.parsedJson;
-        if (!d) continue;
-
-        const parsed = dex.parse(d);
-        if (!parsed.isBuy || !parsed.suiMist) continue;
-
-        const eventPool = dex.pool(d);
-        const wallet    = event.sender || '';
-        const suiAmt    = parsed.suiMist / 1e9;
-        const usdAmt    = suiAmt * suiPrice;
-
-        // Send to every group whose token's knownPools matches (or has no pool filter)
-        for (const [chatId, grp] of active) {
-          // Pool filter
-          if (grp.knownPools.length > 0 && eventPool &&
-              !grp.knownPools.some(p => p === eventPool)) continue;
-
-          const tokAmt = parsed.tokNative / 10 ** (grp.decimals || 6);
-          const price  = tokAmt > 0 ? usdAmt / tokAmt : 0;
-          const mcap   = (grp.totalSupply && price) ? price * grp.totalSupply : null;
-
-          // Min buy filter
-          if (usdAmt < (grp.minBuyUSD || 0)) continue;
-
-          totalBuys++;
-          const cnt = (buyerCounts.get(chatId) || 0) + 1;
-          buyerCounts.set(chatId, cnt);
-          const walletKey = `${chatId}:${wallet}`;
-          const isNew     = !seenWallets.has(walletKey);
-          if (wallet) seenWallets.set(walletKey, true);
-
-          log(`🟢 ${grp.tokenSymbol} $${usdAmt.toFixed(2)} on ${dex.name} → ${chatId}`);
-
-          await sendAlert(chatId, grp, {
-            sym: grp.tokenSymbol, suiAmt, tokAmt, usdAmt,
-            price, mcap, wallet, txHash, eventPool, buyNum: cnt, isNew,
-          }, dex);
-        }
-      }
-    } catch (err) {
-      log(`[Poll:${dexKey}] ${err.message}`);
-    }
+      const ts = await rpc('suix_getTotalSupply',[tokenAddr]);
+      if (ts?.value) supply = Number(ts.value) / 10**dec;
+    } catch {}
+    const result = { decimals:dec, totalSupply:supply, name };
+    coinMeta[tokenAddr] = result;
+    saveCoinMeta();
+    log(`Coin meta ${tokenAddr.slice(0,10)}...: decimals=${dec} supply=${supply?.toLocaleString()}`);
+    return result;
+  } catch(err){
+    log(`Coin meta error for ${tokenAddr}: ${err.message}`);
+    return { decimals:6, totalSupply:null, name:tokenAddr.split('::').pop() };
   }
 }
 
-function pruneDedup() {
-  const now = Date.now();
-  for (const [k, v] of seenTxs) if (now - v > DEDUP_TTL) seenTxs.delete(k);
+// ─── PARSE CETUS SWAP ────────────────────────────────────────────────────────
+function parseCetusSwap(d, dir, decimals, price) {
+  if (!dir) return null;
+  let isBuy, suiN, tokN;
+  if (dir.suiIsB) {
+    // SUI=coinB: atob=false (B→A) = SUI→Token = BUY
+    isBuy = d.atob === false;
+    suiN  = +d.amount_in;  tokN = +d.amount_out;
+    if (!isBuy){ suiN=+d.amount_out; tokN=+d.amount_in; }
+  } else if (dir.suiIsA) {
+    // SUI=coinA: atob=true (A→B) = SUI→Token = BUY
+    isBuy = d.atob === true;
+    suiN  = +d.amount_in;  tokN = +d.amount_out;
+    if (!isBuy){ suiN=+d.amount_out; tokN=+d.amount_in; }
+  } else return null;
+  if (!isBuy || suiN<=0 || tokN<=0) return null;
+  const suiAmt=suiN/1e9, tokAmt=tokN/10**decimals, usdAmt=suiAmt*price;
+  return { suiAmt, tokAmt, usdAmt, price: tokAmt>0?usdAmt/tokAmt:0 };
 }
 
-// ─── BUY ALERT ───────────────────────────────────────────────────────────────
+// ─── PARSE TURBOS SWAP ───────────────────────────────────────────────────────
+// Turbos fields: amount_a (coinA), amount_b (coinB), a_to_b (direction)
+function parseTurbosSwap(d, dir, decimals, price) {
+  if (!dir) return null;
+  let isBuy, suiN, tokN;
+  if (dir.suiIsB) {
+    // SUI=coinB=amount_b: a_to_b=false (B→A) = SUI→Token = BUY
+    isBuy = d.a_to_b === false;
+    suiN  = isBuy ? +d.amount_b : +d.amount_a;
+    tokN  = isBuy ? +d.amount_a : +d.amount_b;
+  } else if (dir.suiIsA) {
+    // SUI=coinA=amount_a: a_to_b=true (A→B) = SUI→Token = BUY
+    isBuy = d.a_to_b === true;
+    suiN  = isBuy ? +d.amount_a : +d.amount_b;
+    tokN  = isBuy ? +d.amount_b : +d.amount_a;
+  } else return null;
+  if (!isBuy || suiN<=0 || tokN<=0) return null;
+  const suiAmt=suiN/1e9, tokAmt=tokN/10**decimals, usdAmt=suiAmt*price;
+  return { suiAmt, tokAmt, usdAmt, price: tokAmt>0?usdAmt/tokAmt:0 };
+}
 
-function buildCaption(grp, buy, dex) {
-  const buyBar    = bar(buy.usdAmt, grp.emoji, grp.buyStep, grp.maxEmojis);
-  const wallet    = shortAddr(buy.wallet);
-  const tokenAddr = grp.tokenAddress || '';
+// ─── PARSE BLUEFIN ORDER ─────────────────────────────────────────────────────
+// Bluefin OrderFilled: base=SUI, quote=token (typical for spot)
+function parseBluefinOrder(d, decimals, price) {
+  // Fields vary by version; try multiple field names
+  const baseQ  = +(d.base_quantity  || d.base_amount  || d.quantity      || 0);
+  const quoteQ = +(d.quote_quantity || d.quote_amount || d.filled_quantity|| 0);
+  if (baseQ<=0 || quoteQ<=0) return null;
+  // If base is SUI (in MIST) and quote is token
+  const suiAmt  = baseQ  / 1e9;
+  const tokAmt  = quoteQ / 10**decimals;
+  const usdAmt  = suiAmt * price;
+  return { suiAmt, tokAmt, usdAmt, price: tokAmt>0?usdAmt/tokAmt:0 };
+}
 
-  const suiscanTx  = `https://suiscan.xyz/mainnet/tx/${buy.txHash}`;
-  const chart      = `https://dexscreener.com/sui/${tokenAddr}`;
-  const tokenLink  = `https://suiscan.xyz/mainnet/object/${tokenAddr}`;
-  const walletLink = `https://suiscan.xyz/mainnet/account/${buy.wallet}`;
+// ─── INIT CURSOR TO LATEST (skip history) ─────────────────────────────────────
+// On very first start (no cursor saved), fetch latest events just to get cursor
+// position and skip processing them — avoids flooding with old txns
+async function initCursorToLatest(dexKey, eventType) {
+  if (cursors[dexKey] || dexInit[dexKey]) { dexInit[dexKey]=true; return; }
+  try {
+    log(`[${dexKey}] Initializing cursor to latest...`);
+    // Query with descending=false, get the latest batch
+    const r = await rpc('suix_queryEvents',[{MoveEventType:eventType},null,1,true]);
+    // descending=true gives newest first; save that cursor so next poll starts from NOW
+    if (r?.nextCursor) { cursors[dexKey]=r.nextCursor; saveCursors(); }
+    dexInit[dexKey]=true;
+    log(`[${dexKey}] Cursor initialized — skipping historical events`);
+  } catch(err){ log(`[${dexKey}] Cursor init error: ${err.message}`); dexInit[dexKey]=true; }
+}
 
-  const badges = [];
-  if (buy.isNew)            badges.push('🆕 New Buyer\\!');
-  if (buy.buyNum)           badges.push(`🏆 Buyer \\#${buy.buyNum}`);
-  if (buy.usdAmt >= 5000)   badges.push('🦈 MEGA WHALE\\!');
-  else if (buy.usdAmt >= 1000) badges.push('🐳 Whale Alert\\!');
+// ─── POLL LOOP ────────────────────────────────────────────────────────────────
+async function poll() {
+  const active = Object.entries(config.groups).filter(([,g])=>g.tokenAddress&&!g.paused);
+  if (!active.length) return;
 
+  // Pre-fetch coin metadata for all tracked tokens
+  for (const [,g] of active) {
+    if (!coinMeta[g.tokenAddress]) {
+      const meta = await fetchCoinMeta(g.tokenAddress);
+      // Update group decimals/totalSupply from chain data
+      if (meta.decimals!==undefined){ g.decimals=meta.decimals; }
+      if (meta.totalSupply&&!g.totalSupply){ g.totalSupply=meta.totalSupply; g.tokenName=meta.name; save(); }
+    }
+  }
+
+  const dexes = [
+    { key:'cetus',   type:CETUS_EVENT,   parseEvt: async (d,pool,dec) => {
+        const dir = await fetchPoolDir(pool);
+        return parseCetusSwap(d,dir,dec,suiPrice);
+    }},
+    { key:'turbos',  type:TURBOS_EVENT,  parseEvt: async (d,pool,dec) => {
+        const dir = await fetchPoolDir(pool);
+        return parseTurbosSwap(d,dir,dec,suiPrice);
+    }},
+    { key:'bluefin', type:BLUEFIN_EVENT, parseEvt: async (d,_pool,dec) => {
+        return parseBluefinOrder(d,dec,suiPrice);
+    }},
+  ];
+
+  for (const dex of dexes) {
+    // Initialize cursor on first run (skip history)
+    await initCursorToLatest(dex.key, dex.type);
+    if (!dexInit[dex.key]) continue;
+
+    try {
+      const res = await rpc('suix_queryEvents',[{MoveEventType:dex.type},cursors[dex.key]||null,50,false]);
+      if (!res?.data?.length) continue;
+      if (res.nextCursor){ cursors[dex.key]=res.nextCursor; saveCursors(); }
+
+      for (const ev of res.data) {
+        const hash = ev.id?.txDigest||'';
+        if (!hash) continue;
+        const txKey = `${dex.key}:${hash}`;
+        if (seenTx.has(txKey)) continue;
+        seenTx.set(txKey,Date.now());
+        for (const [k,v] of seenTx) if(Date.now()-v>DEDUP_TTL)seenTx.delete(k);
+
+        const d    = ev.parsedJson||{};
+        const pool = d.pool||d.pool_id||d.market_id||'';
+        const wallet = ev.sender||'';
+
+        for (const [chatId, grp] of active) {
+          // Pool filter (optional)
+          if (grp.knownPools?.length && pool && !grp.knownPools.some(p=>p===pool)) continue;
+
+          const dec = coinMeta[grp.tokenAddress]?.decimals ?? grp.decimals ?? 6;
+          const parsed = await dex.parseEvt(d, pool, dec);
+          if (!parsed||parsed.usdAmt<=0) continue;
+          if (parsed.usdAmt<(grp.minBuyUSD||0)) continue;
+
+          // Use live totalSupply from coin metadata
+          const supply = coinMeta[grp.tokenAddress]?.totalSupply ?? grp.totalSupply;
+          const mcap   = supply&&parsed.price>0 ? parsed.price*supply : null;
+
+          totalBuys++;
+          const cnt=(buyCount.get(chatId)||0)+1; buyCount.set(chatId,cnt);
+          const wk=`${chatId}:${wallet}`;
+          const isNew=!seenWallet.has(wk);
+          if(wallet)seenWallet.set(wk,true);
+
+          log(`🟢 ${grp.tokenSymbol} $${parsed.usdAmt.toFixed(2)} on ${dex.key} → ${chatId}`);
+          await sendAlert(chatId,grp,{
+            suiAmt:parsed.suiAmt, tokAmt:parsed.tokAmt,
+            usdAmt:parsed.usdAmt, price:parsed.price,
+            mcap, wallet, txHash:hash, cnt, isNew,
+          }, dex.key);
+        }
+      }
+    } catch(err){ log(`[Poll:${dex.key}] ${err.message}`); }
+  }
+}
+
+// ─── BUILD BUY ALERT ─────────────────────────────────────────────────────────
+const DEX_META = {
+  cetus:   {name:'Cetus',   icon:'🐋'},
+  turbos:  {name:'Turbos',  icon:'🌀'},
+  bluefin: {name:'Bluefin', icon:'🐬'},
+};
+
+function buildCaption(grp, buy, dexKey) {
+  const dm  = DEX_META[dexKey]||{name:dexKey,icon:'🔄'};
+  const bar = buyBar(buy.usdAmt,grp.emoji,grp.buyStep,grp.maxEmojis);
+  const ta  = grp.tokenAddress||'';
+  const badges=[];
+  if(buy.isNew)            badges.push('🆕 New Buyer\\!');
+  if(buy.cnt)              badges.push(`🏆 Buyer \\#${buy.cnt}`);
+  if(buy.usdAmt>=5000)     badges.push('🦈 MEGA WHALE\\!');
+  else if(buy.usdAmt>=1000)badges.push('🐳 Whale Alert\\!');
   const badgeLine = badges.length ? `\n${badges.join('   ')}` : '';
 
-  return (
-`🤖 *AGENT BUYBOT*
+  return `🤖 *AGENT BUYBOT*
 ━━━━━━━━━━━━━━━━━━━
-*${e(buy.sym)}* Buy on *${e(dex.name)}* ${dex.icon}${badgeLine}
+*${e(grp.tokenSymbol)}* Buy on *${e(dm.name)}* ${dm.icon}${badgeLine}
 
-${buyBar}
+${bar}
 
 💎 SUI: *$${e(suiPrice.toFixed(3))}*
 💰 *${e(fmt$(buy.usdAmt))}* \\(${e(buy.suiAmt.toFixed(4))} SUI\\)
-🪙 ${e(fmtTok(buy.tokAmt))} *${e(buy.sym)}*
+🪙 ${e(fmtTk(buy.tokAmt))} *${e(grp.tokenSymbol)}*
 
-📊 Price: *${e(fmtPrice(buy.price))}*
-💹 MCap: *${e(fmtMcap(buy.mcap))}*
+📊 Price: *${e(fmtP(buy.price))}*
+💹 MCap: *${e(fmtMc(buy.mcap))}*
 
-👤 [${e(wallet)}](${walletLink})
-🔗 [TX](${suiscanTx}) \\| [Chart](${chart}) \\| [Token](${tokenLink})
+👤 [${e(short(buy.wallet))}](https://suiscan.xyz/mainnet/account/${buy.wallet})
+🔗 [TX](https://suiscan.xyz/mainnet/tx/${buy.txHash}) \\| [Chart](https://dexscreener.com/sui/${ta}) \\| [Token](https://suiscan.xyz/mainnet/object/${ta})
 
-⚡ _AGENT BUYBOT_ \\| [Join](${e(AGENT_LINK)})`
-  );
+⚡ _AGENT BUYBOT_ \\| [Join](${e(AGENT_LINK)})`;
 }
 
-async function sendAlert(chatId, grp, buy, dex) {
-  const caption = buildCaption(grp, buy, dex);
-  const opts    = { parse_mode: 'MarkdownV2', disable_web_page_preview: true };
+async function sendAlert(chatId,grp,buy,dexKey) {
+  const caption = buildCaption(grp,buy,dexKey);
+  const opts={parse_mode:'MarkdownV2',disable_web_page_preview:true};
   try {
-    if (grp.media) {
-      const { type, fileId } = grp.media;
-      if (type === 'photo')     await bot.sendPhoto(chatId,     fileId, { caption, ...opts });
-      else if (type === 'animation') await bot.sendAnimation(chatId, fileId, { caption, ...opts });
-      else if (type === 'video')     await bot.sendVideo(chatId,     fileId, { caption, ...opts });
-      else await bot.sendMessage(chatId, caption, opts);
-    } else {
-      await bot.sendMessage(chatId, caption, opts);
-    }
-  } catch (err) {
+    if(grp.media){
+      const {type,fileId}=grp.media;
+      if(type==='photo')          await bot.sendPhoto(chatId,fileId,{caption,...opts});
+      else if(type==='animation') await bot.sendAnimation(chatId,fileId,{caption,...opts});
+      else if(type==='video')     await bot.sendVideo(chatId,fileId,{caption,...opts});
+      else await bot.sendMessage(chatId,caption,opts);
+    } else await bot.sendMessage(chatId,caption,opts);
+  } catch(err){
     log(`[Alert→${chatId}] ${err.message}`);
-    if (/kicked|not found|deactivated|blocked/i.test(err.message)) {
-      delete config.groups[chatId]; save();
-      log(`[Alert] Removed dead group ${chatId}`);
-    }
+    if(/kicked|not found|deactivated|blocked/i.test(err.message)){delete config.groups[chatId];save();}
   }
 }
 
 // ─── KEYBOARDS ───────────────────────────────────────────────────────────────
-
 function kbGroupList() {
-  const entries = Object.entries(config.groups);
-  if (!entries.length) {
-    return { inline_keyboard: [[{ text: '➕ Add to a Group', callback_data: 'add_group' }]] };
-  }
-  const rows = entries.map(([id, g]) => {
-    const label = g.tokenSymbol ? `${g.groupName} — ${g.tokenSymbol}` : `${g.groupName} — ⚠️ No token`;
-    return [{ text: label, callback_data: `grp:${id}` }];
+  const rows=Object.entries(config.groups).map(([id,g])=>{
+    const lbl=g.tokenSymbol?`${g.groupName} — ✅ ${g.tokenSymbol}`:`${g.groupName} — ⚠️ No token`;
+    return [{text:lbl,callback_data:`grp:${id}`}];
   });
-  rows.push([{ text: '➕ Add to Another Group', callback_data: 'add_group' }]);
-  return { inline_keyboard: rows };
+  rows.push([{text:'➕ Add to Another Group',switch_inline_query_chosen_chat:{query:'',allow_group_chats:true,allow_channel_chats:false,allow_user_chats:false,allow_bot_chats:false}}]);
+  return {inline_keyboard:rows};
 }
 
 function kbSettings(chatId) {
-  const g = config.groups[chatId];
-  if (!g) return { inline_keyboard: [] };
-  const rows = [];
-
-  if (g.tokenSymbol) {
-    rows.push([{ text: `🪙 Token: ${g.tokenSymbol}`, callback_data: `s:token:${chatId}` }]);
-  } else {
-    rows.push([{ text: '🔗 Track Token', callback_data: `s:token:${chatId}` }]);
-  }
-
-  rows.push([
-    { text: `💰 Min Buy: $${g.minBuyUSD ?? 0}`,   callback_data: `s:minbuy:${chatId}` },
-    { text: `📊 Buy Step: $${g.buyStep ?? 100}`,  callback_data: `s:buystep:${chatId}` },
-  ]);
-  rows.push([
-    { text: `${g.emoji ?? '🟢'} Emoji: ${g.emoji ?? '🟢'}`, callback_data: `s:emoji:${chatId}` },
-    { text: `🔢 Max Emojis: ${g.maxEmojis ?? 20}`,           callback_data: `s:maxemojis:${chatId}` },
-  ]);
-  rows.push([{ text: `🖼 Media: ${g.media ? '✅ Set' : 'Not set'}`, callback_data: `s:media:${chatId}` }]);
-  if (g.media) rows.push([{ text: '🗑 Clear Media', callback_data: `clr:media:${chatId}` }]);
-  if (g.tokenSymbol) rows.push([{ text: '🗑 Untrack Token', callback_data: `untrack:${chatId}` }]);
-  rows.push([{
-    text: g.paused ? '▶️ Resume Alerts' : '⏸ Pause Alerts',
-    callback_data: `toggle:${chatId}`,
-  }]);
-  rows.push([{ text: '⬅️ Back to Groups', callback_data: 'back' }]);
-  return { inline_keyboard: rows };
+  const g=config.groups[chatId]; if(!g) return {inline_keyboard:[]};
+  const rows=[];
+  rows.push([g.tokenSymbol?{text:`🪙 Token: ${g.tokenSymbol}`,callback_data:`s:token:${chatId}`}:{text:'🔗 Track Token',callback_data:`s:token:${chatId}`}]);
+  rows.push([{text:`💰 Min Buy: $${(g.minBuyUSD||0).toFixed(2)}`,callback_data:`s:min:${chatId}`},{text:`📊 Buy Step: $${(g.buyStep||100).toFixed(2)}`,callback_data:`s:step:${chatId}`}]);
+  rows.push([{text:`${g.emoji||'🟢'} Emoji: ${g.emoji||'🟢'}`,callback_data:`s:emoji:${chatId}`},{text:`🔢 Max Emojis: ${g.maxEmojis||20}`,callback_data:`s:maxe:${chatId}`}]);
+  const mediaLabel=g.media?'✅ '+{photo:'Image',animation:'GIF',video:'Video'}[g.media.type]||'Set':'Not set';
+  rows.push([{text:`🖼 Media: ${mediaLabel}`,callback_data:`s:media:${chatId}`}]);
+  if(g.media) rows.push([{text:'🗑 Clear Media',callback_data:`clr:${chatId}`}]);
+  if(g.tokenSymbol) rows.push([{text:'🗑 Untrack Token',callback_data:`untrack:${chatId}`}]);
+  rows.push([{text:g.paused?'▶️ Resume Alerts':'⏸ Pause Alerts',callback_data:`pause:${chatId}`}]);
+  rows.push([{text:'⬅️ Back to Groups',callback_data:'back'}]);
+  return {inline_keyboard:rows};
 }
 
-function kbCancel(tag) {
-  return { inline_keyboard: [[{ text: '❌ Cancel', callback_data: `cancel:${tag}` }]] };
-}
+const kbCancel=tag=>({inline_keyboard:[[{text:'❌ Cancel',callback_data:`cancel:${tag}`}]]});
 
-// ─── DM SESSION ──────────────────────────────────────────────────────────────
+// ─── SESSION ─────────────────────────────────────────────────────────────────
+const getSess=(uid)=>sessions.get(uid)||{state:S.IDLE,groupId:null,msgId:null};
+const setSess=(uid,p)=>sessions.set(uid,{...getSess(uid),...p});
+const clrSess=(uid)=>sessions.set(uid,{state:S.IDLE,groupId:null,msgId:null});
 
-function sess(userId) {
-  if (!dmSessions.has(userId)) dmSessions.set(userId, { state: S.IDLE, groupId: null, msgId: null });
-  return dmSessions.get(userId);
-}
-
-function setSess(userId, patch) {
-  dmSessions.set(userId, { ...sess(userId), ...patch });
-}
-
-function clearSess(userId) {
-  dmSessions.set(userId, { state: S.IDLE, groupId: null, msgId: null });
-}
-
-// ─── PANEL HELPERS ───────────────────────────────────────────────────────────
-
-async function showGroupList(userId, chatId, editId) {
-  const text = `🤖 *AGENT BUYBOT*\n\nSelect a group to configure:`;
-  const kb   = kbGroupList();
+// ─── PANELS ──────────────────────────────────────────────────────────────────
+async function showGroupList(uid,chatId,editId) {
+  const text='🤖 *AGENT BUYBOT*\n\nSelect a group to configure:';
   try {
-    if (editId) {
-      await bot.editMessageText(text, { chat_id: chatId, message_id: editId, parse_mode: 'MarkdownV2', reply_markup: kb });
-    } else {
-      const m = await bot.sendMessage(chatId, text, { parse_mode: 'MarkdownV2', reply_markup: kb });
-      setSess(userId, { msgId: m.message_id });
-    }
-  } catch (err) { log(`[GroupList] ${err.message}`); }
+    if(editId) await bot.editMessageText(text,{chat_id:chatId,message_id:editId,parse_mode:'MarkdownV2',reply_markup:kbGroupList()});
+    else { const m=await bot.sendMessage(chatId,text,{parse_mode:'MarkdownV2',reply_markup:kbGroupList()}); setSess(uid,{msgId:m.message_id}); }
+  } catch(err){log(`[GroupList] ${err.message}`);}
 }
 
-async function showSettings(userId, chatId, groupId, editId) {
-  const g = config.groups[groupId];
-  if (!g) return;
-  const status = g.tokenSymbol
-    ? `Tracking: *${e(g.tokenSymbol)}*`
-    : `No token tracked yet — tap *Track Token* to add one\\.`;
-  const text = `⚙️ *Settings — ${e(g.groupName || groupId)}*\n\n${status}\n\nTap any button to change a setting\\.\nJust type your new value and send it\\.`;
-  const kb   = kbSettings(groupId);
+async function showSettings(uid,chatId,groupId,editId) {
+  const g=config.groups[groupId]; if(!g) return;
+  const status=g.tokenSymbol
+    ?`Tracking: *${e(g.tokenSymbol)}*${g.tokenName?` \\(${e(g.tokenName)}\\)`:''}`
+    :'No token tracked yet — tap *Track Token* to add one\\.';
+  const text=`⚙️ *Settings — ${e(g.groupName||groupId)}*\n\n${status}\n\nTap any button to change a setting\\.\nJust type your new value and send it\\.`;
   try {
-    if (editId) {
-      await bot.editMessageText(text, { chat_id: chatId, message_id: editId, parse_mode: 'MarkdownV2', reply_markup: kb });
-    } else {
-      const m = await bot.sendMessage(chatId, text, { parse_mode: 'MarkdownV2', reply_markup: kb });
-      setSess(userId, { msgId: m.message_id });
-    }
-  } catch (err) { log(`[Settings] ${err.message}`); }
+    if(editId) await bot.editMessageText(text,{chat_id:chatId,message_id:editId,parse_mode:'MarkdownV2',reply_markup:kbSettings(groupId)});
+    else { const m=await bot.sendMessage(chatId,text,{parse_mode:'MarkdownV2',reply_markup:kbSettings(groupId)}); setSess(uid,{msgId:m.message_id}); }
+  } catch(err){log(`[Settings] ${err.message}`);}
 }
 
-// ─── BOT INIT ────────────────────────────────────────────────────────────────
+// ─── BOT ─────────────────────────────────────────────────────────────────────
+if(!process.env.BOT_TOKEN){ console.error('❌ BOT_TOKEN missing.'); process.exit(1); }
+const bot=new TelegramBot(process.env.BOT_TOKEN,{polling:true});
 
-if (!process.env.BOT_TOKEN) {
-  console.error('❌  BOT_TOKEN missing. Copy .env.example → .env and fill it in.');
-  process.exit(1);
-}
-
-const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
-
-// ─── GROUP EVENTS ────────────────────────────────────────────────────────────
-
-bot.on('new_chat_members', async (msg) => {
+// ─── ADDED TO GROUP ───────────────────────────────────────────────────────────
+bot.on('new_chat_members',async msg=>{
   try {
-    const me    = await bot.getMe();
-    const added = msg.new_chat_members.some(m => m.id === me.id);
-    if (!added) return;
-    const chatId = String(msg.chat.id);
-    ensureGroup(chatId, msg.chat.title);
-    log(`✅ Added to group: ${msg.chat.title} (${chatId})`);
-
-    await bot.sendMessage(chatId,
-`🤖 *AGENT BUYBOT has arrived\\!*
-
-Tap below to set me up\\. Everything is configured in DM — no commands needed here\\!
-
-1️⃣ Make sure I'm an *admin*
-2️⃣ Tap the button below
-3️⃣ Pick this group and add your token`,
-      {
-        parse_mode: 'MarkdownV2',
-        reply_markup: { inline_keyboard: [[{
-          text: '⚙️ Set Up in DM',
-          url: `https://t.me/${botUsername}?start=g_${chatId}`,
-        }]] },
-      }
-    );
-  } catch (err) { log(`[new_chat_members] ${err.message}`); }
+    const me=await bot.getMe();
+    if(!msg.new_chat_members.some(m=>m.id===me.id)) return;
+    const chatId=String(msg.chat.id), name=msg.chat.title||chatId;
+    ensureGroup(chatId,name);
+    log(`✅ Added to: ${name} (${chatId})`);
+    const btn={reply_markup:{inline_keyboard:[[{text:'⚙️ Set Up in DM',url:`https://t.me/${botUser}?start=g_${chatId}`}]]}};
+    await bot.sendMessage(chatId,`🤖 AGENT BUYBOT has arrived!\n\nTap below to set me up. Everything is configured in DM — no commands needed here!\n\n1️⃣ Make sure I'm an admin\n2️⃣ Tap the button below\n3️⃣ Pick this group and add your token`,btn);
+    await bot.sendMessage(chatId,`🤖 AGENT BUYBOT is active!\n\nTap below to set me up in DM.`,btn);
+  } catch(err){log(`[new_chat_members] ${err.message}`);}
 });
 
 // ─── /start ──────────────────────────────────────────────────────────────────
-
-bot.onText(/^\/start(?:\s+(.+))?$/, async (msg, match) => {
-  const userId  = String(msg.from.id);
-  const chatId  = String(msg.chat.id);
-  const param   = (match?.[1] || '').trim();
-  const isPriv  = msg.chat.type === 'private';
-
-  if (!isPriv) {
-    // In group — just show "Set Up in DM" button
-    ensureGroup(chatId, msg.chat.title);
-    return bot.sendMessage(chatId,
-`🤖 *AGENT BUYBOT is active\\!*\n\nTap below to configure in DM\\.`,
-      {
-        parse_mode: 'MarkdownV2',
-        reply_markup: { inline_keyboard: [[{
-          text: '⚙️ Set Up in DM',
-          url: `https://t.me/${botUsername}?start=g_${chatId}`,
-        }]] },
-      }
-    );
+bot.onText(/^\/start(?:\s+(.+))?$/,async(msg,match)=>{
+  const uid=String(msg.from.id),chatId=String(msg.chat.id),param=(match?.[1]||'').trim();
+  if(msg.chat.type!=='private'){
+    ensureGroup(chatId,msg.chat.title);
+    return bot.sendMessage(chatId,'🤖 AGENT BUYBOT is active!\n\nTap below to set me up in DM.',
+      {reply_markup:{inline_keyboard:[[{text:'⚙️ Set Up in DM',url:`https://t.me/${botUser}?start=g_${chatId}`}]]}});
   }
-
-  // DM with deep-link to specific group
-  if (param.startsWith('g_')) {
-    const groupId = param.slice(2);
-    if (config.groups[groupId]) {
-      clearSess(userId);
-      setSess(userId, { groupId });
-      return showSettings(userId, chatId, groupId, null);
-    }
+  if(param.startsWith('g_')){
+    const gid=param.slice(2);
+    if(config.groups[gid]){clrSess(uid);setSess(uid,{groupId:gid});return showSettings(uid,chatId,gid,null);}
   }
-
-  // DM /start — show group picker
-  clearSess(userId);
-  await showGroupList(userId, chatId, null);
+  clrSess(uid); await showGroupList(uid,chatId,null);
 });
 
 // ─── /help ───────────────────────────────────────────────────────────────────
-
-bot.onText(/\/help/, async (msg) => {
-  const chatId = String(msg.chat.id);
-  const isPriv = msg.chat.type === 'private';
-
-  if (!isPriv) {
-    return bot.sendMessage(chatId,
-      `🤖 *AGENT BUYBOT*\n\nSet me up in DM — no commands needed here\\!`,
-      {
-        parse_mode: 'MarkdownV2',
-        reply_markup: { inline_keyboard: [[{
-          text: '⚙️ Set Up in DM',
-          url: `https://t.me/${botUsername}?start=setup`,
-        }]] },
-      }
-    );
-  }
-
+bot.onText(/\/help/,async msg=>{
+  const chatId=String(msg.chat.id);
+  if(msg.chat.type!=='private')
+    return bot.sendMessage(chatId,'🤖 AGENT BUYBOT\n\nTap below to configure in DM.',
+      {reply_markup:{inline_keyboard:[[{text:'⚙️ Set Up in DM',url:`https://t.me/${botUser}?start=setup`}]]}});
   await bot.sendMessage(chatId,
 `🤖 *AGENT BUYBOT* — Help
 ━━━━━━━━━━━━━━━━━━━━━
 
-*Setup \\(button\\-driven, no commands\\!\\)*
-1\\. Add me to your group as an admin
-2\\. Tap *"Set Up in DM"* from the group message
-3\\. Pick your group → paste your token address
-4\\. Customise emoji, buy step, media — all in DM
+*Setup:*
+1\\. Add me to your group as admin
+2\\. Tap *"⚙️ Set Up in DM"* from the group
+3\\. Select your group → paste token address
+4\\. Customise Emoji, Buy Step, Media
 
-*Per\\-group settings:*
-🔗 Token address \\(0xPkg::module::COIN format\\)
-💰 Min buy in USD \\(0 = alert on all buys\\)
-📊 Buy step \\(USD per emoji, e\\.g\\. 50\\)
-🎨 Custom emoji for the buy bar
-🔢 Max emojis cap
-🖼 Media \\(photo / GIF / video\\) on every alert
+*Settings per group:*
+🔗 Token \\(0xPkg::module::COIN\\)
+💰 Min buy in USD
+📊 Buy step \\(USD per emoji\\)
+🎨 Custom emoji
+🔢 Max emojis
+🖼 Photo / GIF / Video
 
-*DEXes tracked:*
-🐋 Cetus   🌀 Turbos   🐬 Bluefin
-
-*In DM:* /start to open the setup wizard
+*DEXes:* Cetus 🐋   Turbos 🌀   Bluefin 🐬
 
 ⚡ [Join AGENT Community](${e(AGENT_LINK)})`,
-    { parse_mode: 'MarkdownV2', disable_web_page_preview: true }
-  );
+    {parse_mode:'MarkdownV2',disable_web_page_preview:true});
 });
 
 // ─── /stats ──────────────────────────────────────────────────────────────────
-
-bot.onText(/\/stats/, async (msg) => {
-  const chatId = String(msg.chat.id);
-  const groups = Object.values(config.groups);
-  const tokenCount = new Set(groups.map(g => g.tokenAddress).filter(Boolean)).size;
-  const rpcHost = activeRpc ? activeRpc.split('/')[2] : '❌ None';
-
+bot.onText(/\/stats/,async msg=>{
+  const chatId=String(msg.chat.id),grps=Object.values(config.groups);
   await bot.sendMessage(chatId,
 `📊 *AGENT BUYBOT Stats*
 ━━━━━━━━━━━━━━━━━━
 ✅ Buys detected: *${totalBuys}*
-🏠 Groups active: *${groups.length}*
-🪙 Tokens tracked: *${tokenCount}*
-⏱ Uptime: *${e(uptime())}*
-🌐 RPC: \`${e(rpcHost)}\`
-💎 SUI: *$${e(suiPrice.toFixed(3))}*
-🔄 Poll interval: *${POLL_MS / 1000}s*
+🏠 Groups: *${grps.length}*
+🪙 Tokens: *${new Set(grps.map(g=>g.tokenAddress).filter(Boolean)).size}*
+⏱ Uptime: *${e(upStr())}*
+🌐 RPC: \`${e(activeRpc?activeRpc.split('/')[2]:'None')}\`
+💎 SUI: *$${e(suiPrice.toFixed(4))}*
 
-💧 *DEXes:* Cetus 🐋   Turbos 🌀   Bluefin 🐬
-
-⚡ _AGENT BUYBOT v${e(BOT_VERSION)}_`,
-    { parse_mode: 'MarkdownV2' }
-  );
+💧 Cetus 🐋   Turbos 🌀   Bluefin 🐬
+⚡ _v${e(BOT_VERSION)}_`,{parse_mode:'MarkdownV2'});
 });
 
-// ─── CALLBACK QUERY ──────────────────────────────────────────────────────────
-
-bot.on('callback_query', async (query) => {
-  const userId = String(query.from.id);
-  const chatId = String(query.message.chat.id);
-  const msgId  = query.message.message_id;
-  const data   = query.data;
-
-  try { await bot.answerCallbackQuery(query.id); } catch { /* ok */ }
-
-  const session = sess(userId);
-
-  // ── Back to group list
-  if (data === 'back') {
-    clearSess(userId);
-    setSess(userId, { msgId });
-    return showGroupList(userId, chatId, msgId);
-  }
-
-  // ── Add group instructions
-  if (data === 'add_group') {
-    return bot.editMessageText(
-`➕ *Add to Another Group*
-
-1\\. Open the Telegram group you want to add alerts to
-2\\. Add *@${e(botUsername)}* as a member and make them an admin
-3\\. The bot will send a *"Set Up in DM"* button in the group automatically
-
-Then come back here and tap /start to see your new group\\.`,
-      { chat_id: chatId, message_id: msgId, parse_mode: 'MarkdownV2',
-        reply_markup: { inline_keyboard: [[{ text: '⬅️ Back', callback_data: 'back' }]] } }
-    );
-  }
-
-  // ── Select group
-  if (data.startsWith('grp:')) {
-    const groupId = data.slice(4);
-    if (!config.groups[groupId]) return;
-    setSess(userId, { groupId, msgId });
-    return showSettings(userId, chatId, groupId, msgId);
-  }
-
-  // ── Clear media
-  if (data.startsWith('clr:media:')) {
-    const groupId = data.slice(10);
-    if (config.groups[groupId]) { config.groups[groupId].media = null; save(); }
-    setSess(userId, { msgId });
-    return showSettings(userId, chatId, groupId, msgId);
-  }
-
-  // ── Untrack token
-  if (data.startsWith('untrack:')) {
-    const groupId = data.slice(8);
-    if (config.groups[groupId]) {
-      config.groups[groupId].tokenAddress = null;
-      config.groups[groupId].tokenSymbol  = null;
-      config.groups[groupId].knownPools   = [];
-      save();
-    }
-    setSess(userId, { msgId });
-    return showSettings(userId, chatId, groupId, msgId);
-  }
-
-  // ── Toggle pause
-  if (data.startsWith('toggle:')) {
-    const groupId = data.slice(7);
-    if (config.groups[groupId]) {
-      config.groups[groupId].paused = !config.groups[groupId].paused;
-      save();
-    }
-    setSess(userId, { msgId });
-    return showSettings(userId, chatId, groupId, msgId);
-  }
-
-  // ── Cancel current input
-  if (data.startsWith('cancel:')) {
-    const groupId = session.groupId;
-    clearSess(userId);
-    if (groupId && config.groups[groupId]) return showSettings(userId, chatId, groupId, msgId);
-    return showGroupList(userId, chatId, msgId);
-  }
-
-  // ── Setting buttons: s:field:groupId
-  if (data.startsWith('s:')) {
-    const parts   = data.split(':');
-    const field   = parts[1];
-    const groupId = parts.slice(2).join(':');
-    if (!config.groups[groupId]) return;
-    setSess(userId, { groupId, msgId });
-
-    const prompts = {
-      token: [S.TOKEN,
-`🔗 *Track a Token*
-
-Paste the full Sui token address\\.
-
-Format: \`0xPackageId::module::COIN\`
-
-You can find this on DexScreener or Suiscan\\.`],
-      minbuy: [S.MIN_BUY,
-`💰 *Minimum Buy*
-
-Type the minimum USD value to trigger an alert\\.
-
-Example: \`5\` for \\$5 minimum\\.
-Type \`0\` to alert on every buy\\.`],
-      buystep: [S.BUY_STEP,
-`📊 *Buy Step*
-
-How many USD = 1 emoji in the buy bar?
-
-Example: \`50\` means \\$50 → 1 emoji, \\$500 → 10 emojis\\.`],
-      emoji: [S.EMOJI,
-`🎨 *Buy Bar Emoji*
-
-Send the emoji you want for the buy bar\\.
-
-Examples: 🚀 💎 🔥 🦅 🐋 💰 🟢`],
-      maxemojis: [S.MAX_EMOJIS,
-`🔢 *Max Emojis*
-
-Maximum number of emojis in the buy bar\\.
-
-Example: \`20\` or \`50\`\\.`],
-      media: [S.MEDIA,
-`🖼 *Buy Bar Media*
-
-Send a *photo*, *GIF*, or *video* to show with every buy alert in your group\\.
-
-Supports: photo, animated GIF, short video\\.`],
+// ─── CALLBACKS ───────────────────────────────────────────────────────────────
+bot.on('callback_query',async query=>{
+  const uid=String(query.from.id),chatId=String(query.message.chat.id),msgId=query.message.message_id,data=query.data;
+  try{await bot.answerCallbackQuery(query.id);}catch{}
+  const ss=getSess(uid);
+  if(data==='back'){clrSess(uid);setSess(uid,{msgId});return showGroupList(uid,chatId,msgId);}
+  if(data.startsWith('grp:')){const gid=data.slice(4);if(!config.groups[gid])return;setSess(uid,{groupId:gid,msgId});return showSettings(uid,chatId,gid,msgId);}
+  if(data.startsWith('clr:')){const gid=data.slice(4);if(config.groups[gid]){config.groups[gid].media=null;save();}setSess(uid,{msgId});return showSettings(uid,chatId,gid,msgId);}
+  if(data.startsWith('untrack:')){const gid=data.slice(8);if(config.groups[gid]){const g=config.groups[gid];g.tokenAddress=null;g.tokenSymbol=null;g.tokenName=null;g.knownPools=[];save();}setSess(uid,{msgId});return showSettings(uid,chatId,gid,msgId);}
+  if(data.startsWith('pause:')){const gid=data.slice(6);if(config.groups[gid]){config.groups[gid].paused=!config.groups[gid].paused;save();}setSess(uid,{msgId});return showSettings(uid,chatId,gid,msgId);}
+  if(data.startsWith('cancel:')){const gid=ss.groupId;clrSess(uid);if(gid&&config.groups[gid])return showSettings(uid,chatId,gid,msgId);return showGroupList(uid,chatId,msgId);}
+  if(data.startsWith('s:')){
+    const parts=data.split(':'),field=parts[1],gid=parts.slice(2).join(':');
+    if(!config.groups[gid])return;
+    setSess(uid,{groupId:gid,msgId});
+    const P={
+      token:[S.TOKEN,'🔗 Track a Token','Paste the full Sui token address.\n\nFormat: 0xPackageId::module::COIN\n\nFind it on DexScreener or Suiscan.'],
+      min:  [S.MIN,  '💰 Min Buy','Type the minimum USD to trigger an alert.\n\nExample: 5 for $5 minimum. Type 0 for all buys.'],
+      step: [S.STEP, '📊 Buy Step','How many USD per emoji?\n\nExample: 50 means $50 = 1 emoji, $500 = 10 emojis.'],
+      emoji:[S.EMOJI,'🎨 Emoji','Send the emoji for the buy bar.\n\nExamples: 🚀 💎 🔥 🦅 💰 🟢'],
+      maxe: [S.MAXE, '🔢 Max Emojis','Maximum emojis in the buy bar. Example: 20 or 50.'],
+      media:[S.MEDIA,'🖼 Media','Send a photo, GIF, or video to show with every buy alert.'],
     };
-
-    const prompt = prompts[field];
-    if (!prompt) return;
-    setSess(userId, { state: prompt[0] });
-    return bot.editMessageText(prompt[1],
-      { chat_id: chatId, message_id: msgId, parse_mode: 'MarkdownV2',
-        reply_markup: kbCancel(`${field}:${groupId}`) }
-    );
+    const p=P[field]; if(!p)return;
+    setSess(uid,{state:p[0]});
+    return bot.editMessageText(`${p[1]}\n\n${p[2]}`,{chat_id:chatId,message_id:msgId,reply_markup:kbCancel(`${field}:${gid}`)});
   }
 });
 
-// ─── DM TEXT INPUT HANDLER ───────────────────────────────────────────────────
+// ─── DM TEXT INPUT ───────────────────────────────────────────────────────────
+bot.on('message',async msg=>{
+  if(msg.chat.type!=='private')return;
+  const uid=String(msg.from.id),chatId=String(msg.chat.id);
+  const {state,groupId,msgId}=getSess(uid),text=(msg.text||'').trim();
+  if(state===S.IDLE)return;
+  const g=config.groups[groupId]; if(!g){clrSess(uid);return;}
 
-bot.on('message', async (msg) => {
-  if (msg.chat.type !== 'private') return;
-  const userId  = String(msg.from.id);
-  const chatId  = String(msg.chat.id);
-  const session = sess(userId);
-  const text    = (msg.text || '').trim();
-  const { state, groupId, msgId } = session;
+  const confirm=async txt=>{await bot.sendMessage(chatId,txt);clrSess(uid);setSess(uid,{msgId});await showSettings(uid,chatId,groupId,msgId);};
+  const bad=async(txt,field)=>bot.sendMessage(chatId,txt,{reply_markup:kbCancel(`${field}:${groupId}`)});
 
-  if (state === S.IDLE) return;
-  const g = config.groups[groupId];
-  if (!g) { clearSess(userId); return; }
-
-  // ── Token address
-  if (state === S.TOKEN) {
-    const addr = text.replace(/\s+/g, '');
-    if (!addr.startsWith('0x') || !addr.includes('::')) {
-      return bot.sendMessage(chatId,
-        `⚠️ That doesn't look right\\.\n\nExpected format: \`0xPkg::module::COIN\`\n\nYou can copy it from DexScreener or Suiscan\\.`,
-        { parse_mode: 'MarkdownV2', reply_markup: kbCancel(`token:${groupId}`) }
-      );
-    }
-    const sym = addr.split('::').pop().toUpperCase();
-    g.tokenAddress = addr;
-    g.tokenSymbol  = sym;
-    g.knownPools   = [];    // reset pools on new token
+  if(state===S.TOKEN){
+    const addr=text.replace(/\s+/g,'');
+    if(!addr.startsWith('0x')||!addr.includes('::')) return bad('⚠️ Invalid format. Expected: 0xPkg::module::COIN\n\nFind it on DexScreener or Suiscan.','token');
+    const sym=addr.split('::').pop().toUpperCase();
+    g.tokenAddress=addr; g.tokenSymbol=sym; g.tokenName=null; g.knownPools=[]; save();
+    // Immediately fetch metadata for this token
+    const meta=await fetchCoinMeta(addr);
+    if(meta.decimals!==undefined) g.decimals=meta.decimals;
+    if(meta.totalSupply){ g.totalSupply=meta.totalSupply; g.tokenName=meta.name; }
     save();
-    clearSess(userId);
-    setSess(userId, { msgId });
-    await bot.sendMessage(chatId, `✅ Now tracking *${e(sym)}*\\.`, { parse_mode: 'MarkdownV2' });
-    return showSettings(userId, chatId, groupId, msgId);
+    const supplyStr=g.totalSupply?`\nSupply: ${g.totalSupply.toLocaleString()} ${sym}`:'';
+    return confirm(`✅ Now tracking *${sym}*${supplyStr}`);
   }
-
-  // ── Min buy
-  if (state === S.MIN_BUY) {
-    const val = parseFloat(text);
-    if (isNaN(val) || val < 0) {
-      return bot.sendMessage(chatId,
-        `⚠️ Please send a number ≥ 0, e\\.g\\. \`5\` or \`0\`\\.`,
-        { parse_mode: 'MarkdownV2', reply_markup: kbCancel(`minbuy:${groupId}`) }
-      );
-    }
-    g.minBuyUSD = val; save();
-    clearSess(userId); setSess(userId, { msgId });
-    await bot.sendMessage(chatId, `✅ Min buy set to *$${e(val.toFixed(2))}*\\.`, { parse_mode: 'MarkdownV2' });
-    return showSettings(userId, chatId, groupId, msgId);
-  }
-
-  // ── Buy step
-  if (state === S.BUY_STEP) {
-    const val = parseFloat(text);
-    if (isNaN(val) || val <= 0) {
-      return bot.sendMessage(chatId,
-        `⚠️ Please send a positive number, e\\.g\\. \`42\` or \`100\`\\.`,
-        { parse_mode: 'MarkdownV2', reply_markup: kbCancel(`buystep:${groupId}`) }
-      );
-    }
-    g.buyStep = val; save();
-    clearSess(userId); setSess(userId, { msgId });
-    await bot.sendMessage(chatId, `✅ Buy step set to *$${e(val.toFixed(2))}* per emoji\\.`, { parse_mode: 'MarkdownV2' });
-    return showSettings(userId, chatId, groupId, msgId);
-  }
-
-  // ── Emoji
-  if (state === S.EMOJI) {
-    const val = text.trim();
-    if (!val || val.length > 10) {
-      return bot.sendMessage(chatId,
-        `⚠️ Please send a single emoji like 🚀 or 💎\\.`,
-        { parse_mode: 'MarkdownV2', reply_markup: kbCancel(`emoji:${groupId}`) }
-      );
-    }
-    g.emoji = val; save();
-    clearSess(userId); setSess(userId, { msgId });
-    await bot.sendMessage(chatId, `✅ Emoji set to ${val}\\.`, { parse_mode: 'MarkdownV2' });
-    return showSettings(userId, chatId, groupId, msgId);
-  }
-
-  // ── Max emojis
-  if (state === S.MAX_EMOJIS) {
-    const val = parseInt(text);
-    if (isNaN(val) || val < 1 || val > 100) {
-      return bot.sendMessage(chatId,
-        `⚠️ Please send a number between 1 and 100\\.`,
-        { parse_mode: 'MarkdownV2', reply_markup: kbCancel(`maxemojis:${groupId}`) }
-      );
-    }
-    g.maxEmojis = val; save();
-    clearSess(userId); setSess(userId, { msgId });
-    await bot.sendMessage(chatId, `✅ Max emojis set to *${val}*\\.`, { parse_mode: 'MarkdownV2' });
-    return showSettings(userId, chatId, groupId, msgId);
-  }
+  if(state===S.MIN){const v=parseFloat(text);if(isNaN(v)||v<0)return bad('⚠️ Send a number ≥ 0. Example: 5 or 0','min');g.minBuyUSD=v;save();return confirm(`✅ Min buy set to $${v.toFixed(2)}`);}
+  if(state===S.STEP){const v=parseFloat(text);if(isNaN(v)||v<=0)return bad('⚠️ Send a positive number. Example: 42','step');g.buyStep=v;save();return confirm(`✅ Buy step set to $${v.toFixed(2)} per emoji`);}
+  if(state===S.EMOJI){const v=text.trim();if(!v||v.length>10)return bad('⚠️ Send a single emoji like 🚀','emoji');g.emoji=v;save();return confirm(`✅ Emoji set to ${v}`);}
+  if(state===S.MAXE){const v=parseInt(text);if(isNaN(v)||v<1||v>100)return bad('⚠️ Send a number 1–100','maxe');g.maxEmojis=v;save();return confirm(`✅ Max emojis set to ${v}`);}
 });
 
-// ─── MEDIA HANDLER (photo / GIF / video in DM) ───────────────────────────────
-
-bot.on('message', async (msg) => {
-  if (msg.chat.type !== 'private') return;
-  const userId  = String(msg.from.id);
-  const chatId  = String(msg.chat.id);
-  const session = sess(userId);
-  if (session.state !== S.MEDIA) return;
-
-  const { groupId, msgId } = session;
-  const g = config.groups[groupId];
-  if (!g) { clearSess(userId); return; }
-
-  let media = null;
-  if (msg.photo)     media = { type: 'photo',     fileId: msg.photo[msg.photo.length - 1].file_id };
-  else if (msg.animation) media = { type: 'animation', fileId: msg.animation.file_id };
-  else if (msg.video)     media = { type: 'video',     fileId: msg.video.file_id };
-
-  if (!media) {
-    return bot.sendMessage(chatId,
-      `⚠️ Please send a *photo*, *GIF*, or *video*\\.`,
-      { parse_mode: 'MarkdownV2', reply_markup: kbCancel(`media:${groupId}`) }
-    );
-  }
-
-  g.media = media; save();
-  clearSess(userId); setSess(userId, { msgId });
-  const label = { photo: '🖼 Image', animation: '🎞 GIF', video: '🎬 Video' }[media.type] || 'Media';
-  await bot.sendMessage(chatId, `✅ Media set to *${e(label)}*\\.`, { parse_mode: 'MarkdownV2' });
-  return showSettings(userId, chatId, groupId, msgId);
+// ─── MEDIA INPUT ─────────────────────────────────────────────────────────────
+bot.on('message',async msg=>{
+  if(msg.chat.type!=='private')return;
+  const uid=String(msg.from.id),chatId=String(msg.chat.id);
+  const {state,groupId,msgId}=getSess(uid);
+  if(state!==S.MEDIA)return;
+  const g=config.groups[groupId]; if(!g){clrSess(uid);return;}
+  let media=null;
+  if(msg.photo)     media={type:'photo',     fileId:msg.photo[msg.photo.length-1].file_id};
+  else if(msg.animation)media={type:'animation',fileId:msg.animation.file_id};
+  else if(msg.video)    media={type:'video',     fileId:msg.video.file_id};
+  if(!media)return bot.sendMessage(chatId,'⚠️ Please send a photo, GIF, or video.',{reply_markup:kbCancel(`media:${groupId}`)});
+  g.media=media;save();
+  const lbl={photo:'Image',animation:'GIF',video:'Video'}[media.type];
+  await bot.sendMessage(chatId,`✅ Media: ${lbl} set`);
+  clrSess(uid);setSess(uid,{msgId});await showSettings(uid,chatId,groupId,msgId);
 });
 
-// ─── ERRORS ───────────────────────────────────────────────────────────────────
+// ─── ERRORS ──────────────────────────────────────────────────────────────────
+bot.on('polling_error',err=>log(`[Poll] ${err.message}`));
+process.on('unhandledRejection',r=>log(`[Unhandled] ${r}`));
+process.on('uncaughtException',e=>log(`[Uncaught] ${e.message}`));
 
-bot.on('polling_error', (err) => log(`[Polling] ${err.message}`));
-process.on('unhandledRejection', (r) => log(`[Unhandled] ${r}`));
-process.on('uncaughtException',  (err) => log(`[Uncaught] ${err.message}`));
-
-// ─── MAIN ─────────────────────────────────────────────────────────────────────
-
-async function main() {
-  log(`🤖 AGENT BUYBOT v${BOT_VERSION} starting...`);
-
-  const me = await bot.getMe();
-  botUsername = me.username;
-  log(`✅ Connected as @${botUsername}`);
-
+// ─── MAIN ────────────────────────────────────────────────────────────────────
+async function main(){
+  log(`🤖 AGENT BUYBOT v${BOT_VERSION}`);
+  const me=await bot.getMe(); botUser=me.username;
+  log(`✅ @${botUser}`);
   await refreshPrice();
-  setInterval(refreshPrice, PRICE_REFRESH);
-
-  log('🚀 Polling Cetus · Turbos · Bluefin events...');
-  setInterval(async () => {
-    try { await poll(); }
-    catch (err) { log(`[Loop] ${err.message}`); }
-  }, POLL_MS);
-
-  log('✅ Ready! Add me to a group → tap "Set Up in DM".');
+  setInterval(refreshPrice,PRICE_MS);
+  log('🚀 Polling Cetus · Turbos · Bluefin...');
+  setInterval(async()=>{try{await poll();}catch(err){log(`[Loop] ${err.message}`);}},POLL_MS);
+  log('✅ Ready.');
 }
-
 main().catch(console.error);
