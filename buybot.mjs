@@ -411,7 +411,7 @@ function kbGroupList() {
     const lbl=g.tokenSymbol?`${g.groupName} — ✅ ${g.tokenSymbol}`:`${g.groupName} — ⚠️ No token`;
     return [{text:lbl,callback_data:`grp:${id}`}];
   });
-  rows.push([{text:'➕ Add to Another Group',switch_inline_query_chosen_chat:{query:'',allow_group_chats:true,allow_channel_chats:false,allow_user_chats:false,allow_bot_chats:false}}]);
+  rows.push([{text:'➕ Add to Another Group', url:`https://t.me/${botUser}?startgroup=add`}]);
   return {inline_keyboard:rows};
 }
 
