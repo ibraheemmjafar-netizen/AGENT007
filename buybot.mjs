@@ -44,13 +44,13 @@ const POOL_FILE   = path.join(DATA_DIR, 'pool_dir.json');
 const META_FILE   = path.join(DATA_DIR, 'coin_meta.json');
 
 // ─── CONSTANTS ───────────────────────────────────────────────────────────────
-const BOT_VERSION   = '3.2.0';
+const BOT_VERSION   = '3.3.0';
 const POLL_MS       = 4_000;
 const PRICE_MS      = 30_000;
 const STATS_MS      = 86_400_000;
 const DEDUP_TTL     = 600_000;
 const MAX_TOKENS    = 5;
-const POOL_RETRY_MS = 60_000;
+const POOL_RETRY_MS = 15_000;  // reduced: retry failed pool-dir after 15 s
 const AGENT_LINK    = 'https://t.me/Sui_Agent/1';
 const SUI_TYPE      = '0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI';
 const SUI_PRICE_URL = 'https://api.coingecko.com/api/v3/simple/price?ids=sui&vs_currencies=usd';
@@ -65,10 +65,13 @@ const RPC_POOL = [
   'https://fullnode.mainnet.sui.io',
 ];
 
-const CETUS_EVT   = '0x1eabed72c53feb3805120a081dc15963c204dc8d091542592abaf7a35689b2fb::pool::SwapEvent';
-const TURBOS_EVT  = '0x91bfbc386a41afcfd9b2533058d7e915a1d3829089cc268ff4333d54d6339ca1::pool::SwapEvent';
-const BLUEFIN_EVT = '0x3492c874c1e3b3e2984e8c41b589e642d4d0a5d6459e5a9cfc2d52fd7c89c267::spot_dex::OrderFilled';
-const DEX_META    = { cetus:{name:'Cetus',icon:'🐋'}, turbos:{name:'Turbos',icon:'🌀'}, bluefin:{name:'Bluefin',icon:'🐬'} };
+const CETUS_EVT    = '0x1eabed72c53feb3805120a081dc15963c204dc8d091542592abaf7a35689b2fb::pool::SwapEvent';
+const TURBOS_EVT   = '0x91bfbc386a41afcfd9b2533058d7e915a1d3829089cc268ff4333d54d6339ca1::pool::SwapEvent';
+const BLUEFIN_EVT  = '0x3492c874c1e3b3e2984e8c41b589e642d4d0a5d6459e5a9cfc2d52fd7c89c267::spot_dex::OrderFilled';
+// Moonbags.io — TradedEventV2 carries is_buy, sui_amount, token_amount, token_address all in one
+const MOONBAGS_EVT = '0xa9aee0477f07c13ecca43d090bb0254af44986806bdfa92db24be4301b7b137f::moonbags::TradedEventV2';
+const MOONBAGS_API = 'https://api2.moonbags.io';
+const DEX_META     = { cetus:{name:'Cetus',icon:'🐋'}, turbos:{name:'Turbos',icon:'🌀'}, bluefin:{name:'Bluefin',icon:'🐬'}, moonbags:{name:'Moonbags',icon:'🎒'} };
 
 // Wizard states
 const S = {
@@ -100,7 +103,8 @@ const statsMap     = new Map();
 const sessions     = new Map();
 const poolInFlight = new Set();
 const poolFailed   = new Map();
-const dexPriceCache= new Map();
+const dexPriceCache  = new Map();
+const moonbagsCache  = new Map();
 
 // ─── PERSISTENCE ─────────────────────────────────────────────────────────────
 function loadJson(file, def) {
@@ -237,6 +241,33 @@ async function dexPriceCached(addr) {
   const data = await fetchDexPrice(addr);
   dexPriceCache.set(addr, {data, ts:Date.now()});
   return data;
+}
+
+// ─── MOONBAGS API ─────────────────────────────────────────────────────────────
+// Fetches price, market cap, and bonding-curve progress % for a Moonbags token.
+// Cached 30 s to avoid hammering the API on every alert.
+async function fetchMoonbagsPrice(tokenAddr) {
+  const c = moonbagsCache.get(tokenAddr);
+  if (c && Date.now()-c.ts < 30_000) return c.data;
+  try {
+    // Moonbags API requires the 0x prefix on the full coinType path param.
+    // Event token_address fields may arrive without it — normalise here.
+    const withPrefix = tokenAddr.startsWith('0x') ? tokenAddr : '0x' + tokenAddr;
+    const r = await axios.get(
+      `${MOONBAGS_API}/api/v1/coin/${encodeURIComponent(withPrefix)}`,
+      { timeout:7000 }
+    );
+    const t = r.data;
+    if (!t?.tokenAddress) { moonbagsCache.set(tokenAddr,{data:null,ts:Date.now()}); return null; }
+    const data = {
+      priceUsd:     t.priceUsd     || null,
+      mcap:         t.mcapUsd      || t.mcap || null,
+      bondingCurve: typeof t.bondingCurve === 'number' ? t.bondingCurve : null,
+      isGraduated:  !!t.listedPoolId,
+    };
+    moonbagsCache.set(tokenAddr, {data, ts:Date.now()});
+    return data;
+  } catch { moonbagsCache.set(tokenAddr,{data:null,ts:Date.now()}); return null; }
 }
 
 // ─── ADDRESS NORMALISATION ────────────────────────────────────────────────────
@@ -390,6 +421,19 @@ function parseBluefin(d, dir, dec) {
   return { suiAmt:quoteQ/1e9, tokAmt:baseQ/10**dec };
 }
 
+// ─── MOONBAGS PARSER ─────────────────────────────────────────────────────────
+// TradedEventV2 fields: is_buy, sui_amount (mist), token_amount (raw),
+// token_address (full coinType), user (wallet), pool_id, fee,
+// virtual_sui_reserves, virtual_token_reserves.
+// No pool direction lookup needed — all amounts are explicit in the event.
+function parseMoonbags(d, dec) {
+  if (!d.is_buy) return null;                     // sells = not a buy alert
+  const suiRaw = +(d.sui_amount  || 0);
+  const tokRaw = +(d.token_amount || 0);
+  if (suiRaw <= 0 || tokRaw <= 0) return null;
+  return { suiAmt: suiRaw / 1e9, tokAmt: tokRaw / 10**dec };
+}
+
 // ─── CURSOR INIT — skips history on first launch ─────────────────────────────
 // Fetches the latest event cursor so only NEW transactions are processed.
 // Because cursors are NOT persisted across restarts (see above), this always
@@ -406,6 +450,10 @@ async function initCursor(dexKey, eventType) {
 }
 
 // ─── POLL LOOP ────────────────────────────────────────────────────────────────
+// Standard DEXes (Cetus/Turbos/Bluefin): need pool dir to identify the token.
+// Launchpad DEXes (Moonbags): token address is in the event — no pool dir needed.
+//   launchpad:true   → skip fetchPoolDir; match token via tokenAddr(d) instead
+//   wallet(d)        → how to extract buyer wallet (defaults to ev.sender)
 const DEXES = [
   { key:'cetus',   type:CETUS_EVT,
     async parse(d,pool,dec){ const dir=await fetchPoolDir(pool); return parseCetus(d,dir,dec); },
@@ -414,10 +462,18 @@ const DEXES = [
     async parse(d,pool,dec){ const dir=await fetchPoolDir(pool); return parseTurbos(d,dir,dec); },
     pool: d => d.pool||'' },
   { key:'bluefin', type:BLUEFIN_EVT,
-    // Pass pool dir to parseBluefin so it can correctly identify which side is SUI.
-    // Bluefin convention: base=coinA (token), quote=coinB (SUI/stablecoin).
     async parse(d,pool,dec){ const dir=await fetchPoolDir(pool); return parseBluefin(d,dir,dec); },
     pool: d => d.market_id||d.pool_id||'' },
+  // Moonbags.io bonding-curve launchpad.
+  // TradedEventV2 has all fields inline: is_buy, sui_amount, token_amount,
+  // token_address (coinType), user (buyer wallet), pool_id.
+  // No pool-direction lookup needed — token matching uses token_address directly.
+  { key:'moonbags', type:MOONBAGS_EVT, launchpad:true,
+    async parse(d,pool,dec){ return parseMoonbags(d,dec); },
+    pool:      d => d.pool_id||'',
+    tokenAddr: d => d.token_address||'',
+    wallet:    d => d.user||'',
+  },
 ];
 
 async function poll() {
@@ -449,28 +505,72 @@ async function poll() {
           for (const [k,v] of seenTx) if(Date.now()-v>DEDUP_TTL) seenTx.delete(k);
         }
 
-        const d      = ev.parsedJson||{};
-        const pool   = dex.pool(d);
-        const wallet = ev.sender||'';
+        const d    = ev.parsedJson||{};
+        const pool = dex.pool(d);
 
-        // Fetch pool coin types for all DEXes (Cetus, Turbos, and Bluefin).
-        // fetchPoolDir returns { suiIsA, suiIsB, coinA, coinB } so we can:
+        // Wallet: launchpad DEXes embed the buyer in the event (d.user);
+        // standard DEXes use the transaction sender.
+        const wallet = (dex.wallet ? dex.wallet(d) : '') || ev.sender || '';
+
+        // ── LAUNCHPAD PATH (Moonbags) ─────────────────────────────────────────
+        // Token address is explicit in the event — no pool dir fetch needed.
+        // We match directly: normSuiAddr(event.token_address) === normSuiAddr(tok.address).
+        if (dex.launchpad) {
+          const evTokAddr = dex.tokenAddr ? dex.tokenAddr(d) : '';
+          if (!evTokAddr) continue;
+          for (const [chatId, grp] of activeGroups) {
+            for (const tok of grp.tokens) {
+              if (tok.paused) continue;
+              if (normSuiAddr(evTokAddr) !== normSuiAddr(tok.address)) continue;
+
+              // Moonbags tokens default to 9 decimals (same as SUI).
+              const dec    = coinMeta[tok.address]?.decimals ?? tok.decimals ?? 9;
+              const parsed = await dex.parse(d, pool, dec);
+              if (!parsed||parsed.suiAmt<=0||parsed.tokAmt<=0) continue;
+
+              const usdAmt = parsed.suiAmt * suiPrice;
+              if (usdAmt < (tok.minBuyUSD||0)) continue;
+
+              // Moonbags API: price, mcap, bonding-curve progress.
+              const mbData       = await fetchMoonbagsPrice(tok.address);
+              const price        = mbData?.priceUsd || (parsed.tokAmt>0 ? usdAmt/parsed.tokAmt : 0);
+              const mcap         = mbData?.mcap || null;
+              const bondingCurve = mbData?.bondingCurve ?? null;
+
+              totalBuys++; lastBuyTs=Date.now();
+              updateStats(getStats(chatId, tok.address), usdAmt, wallet);
+              const wk    = `${chatId}:${wallet}`;
+              const isNew = !seenWallet.has(wk);
+              if (wallet) seenWallet.set(wk, true);
+              const buyNum = getStats(chatId, tok.address).buys;
+              const wLabel = grp.knownWallets?.[wallet]||null;
+
+              log(`🎒 ${tok.symbol} $${usdAmt.toFixed(2)} on moonbags → ${chatId}`);
+              await sendAlert(chatId, grp, tok, {
+                suiAmt:parsed.suiAmt, tokAmt:parsed.tokAmt,
+                usdAmt, price, mcap, wallet, txHash:hash, buyNum, isNew, wLabel,
+                bondingCurve,
+              }, dex.key);
+            }
+          }
+          continue; // skip pool-dir logic below
+        }
+
+        // ── STANDARD DEX PATH (Cetus / Turbos / Bluefin) ─────────────────────
+        // Fetch pool coin types so we can:
         //   1. verify the tracked token is actually in this pool
         //   2. correctly identify the SUI side when parsing amounts
         const dir = await fetchPoolDir(pool);
-
-        // If pool dir is unknown (fetch failed or still in-flight), skip this event.
-        // We must not fire alerts without knowing the pool's coin types — otherwise
-        // any swap on any pool would trigger for every tracked token.
-        if (!dir) continue;
+        if (!dir) {
+          log(`[${dex.key}] pool dir unavailable for ${pool.slice(0,20)}… — event skipped`);
+          continue;
+        }
 
         for (const [chatId, grp] of activeGroups) {
           for (const tok of grp.tokens) {
             if (tok.paused) continue;
 
-            // ── KEY CHECK: verify this pool actually involves the tracked token ──
             // dir.coinA / dir.coinB are the two coins in the pool.
-            // Skip if the tracked token is not one of them.
             if (!tokenInPool(tok.address, dir.coinA, dir.coinB)) continue;
 
             const dec    = coinMeta[tok.address]?.decimals ?? tok.decimals ?? 6;
@@ -520,9 +620,19 @@ function buildCaption(grp, tok, buy, dexKey) {
   else if (buy.usdAmt>=1000) badges.push('🐳 Whale Alert\\!');
   const badgeLine = badges.length ? `\n${badges.join('   ')}` : '';
 
+  // Bonding-curve progress line — only for Moonbags (and any future launchpad)
+  const curveLine = (buy.bondingCurve != null)
+    ? `\n🎯 Bonding curve: *${e(buy.bondingCurve.toFixed(1))}%* to graduation`
+    : '';
+
+  // For Moonbags tokens link directly to moonbags.io; others to dexscreener
+  const chartLink = dexKey === 'moonbags'
+    ? `[moonbags\\.io](https://moonbags.io/token/${ta})`
+    : `[Chart](https://dexscreener.com/sui/${ta})`;
+
   return `🤖 *AGENT BUYBOT*
 ━━━━━━━━━━━━━━━━━━━
-*${e(tok.symbol)}* Buy on *${e(dm.name)}* ${dm.icon}${badgeLine}
+*${e(tok.symbol)}* Buy on *${e(dm.name)}* ${dm.icon}${badgeLine}${curveLine}
 
 ${bar}
 
@@ -534,7 +644,7 @@ ${bar}
 💹 MCap: *${e(fmtMc(buy.mcap))}*
 
 👤 [${wl}](https://suiscan.xyz/mainnet/account/${buy.wallet})
-🔗 [TX](https://suiscan.xyz/mainnet/tx/${buy.txHash}) \\| [Chart](https://dexscreener.com/sui/${ta}) \\| [Token](https://suiscan.xyz/mainnet/object/${ta})
+🔗 [TX](https://suiscan.xyz/mainnet/tx/${buy.txHash}) \\| ${chartLink} \\| [Token](https://suiscan.xyz/mainnet/object/${ta})
 
 ⚡ _AGENT BUYBOT_ \\| [Join](${e(AGENT_LINK)})`;
 }
@@ -1081,7 +1191,7 @@ async function main() {
   setInterval(refreshSuiPrice, PRICE_MS);
   setInterval(broadcast24h, STATS_MS);
 
-  log('🚀 Polling Cetus · Turbos · Bluefin...');
+  log('🚀 Polling Cetus · Turbos · Bluefin · Moonbags...');
   setInterval(async () => { try { await poll(); } catch(err) { log(`[Loop] ${err.message}`); } }, POLL_MS);
   log('✅ Ready. Each user manages only their own groups.');
 }
