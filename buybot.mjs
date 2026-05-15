@@ -285,27 +285,62 @@ async function fetchCoinMeta(addr) {
 }
 
 // ─── SWAP PARSERS ─────────────────────────────────────────────────────────────
+// SUI trade range: 0.1 SUI (1e8 MIST) to 100,000 SUI (1e14 MIST)
+const isSuiRange = n => n >= 1e8 && n <= 1e14;
+
 function parseCetus(d, dir, dec) {
-  if (!dir) return null;
-  let isBuy, suiN, tokN;
-  if (dir.suiIsB) {
-    isBuy=d.atob===false; suiN=isBuy?+d.amount_in:+d.amount_out; tokN=isBuy?+d.amount_out:+d.amount_in;
-  } else if (dir.suiIsA) {
-    isBuy=d.atob===true;  suiN=isBuy?+d.amount_in:+d.amount_out; tokN=isBuy?+d.amount_out:+d.amount_in;
-  } else return null;
-  if (!isBuy||suiN<=0||tokN<=0) return null;
-  return { suiAmt:suiN/1e9, tokAmt:tokN/10**dec };
+  const i = +d.amount_in, o = +d.amount_out;
+  if (i <= 0 || o <= 0) return null;
+
+  // ── Accurate path: pool direction known ──────────────────────────────
+  if (dir) {
+    let isBuy, suiN, tokN;
+    if (dir.suiIsB) {
+      isBuy=d.atob===false; suiN=isBuy?i:o; tokN=isBuy?o:i;
+    } else if (dir.suiIsA) {
+      isBuy=d.atob===true;  suiN=isBuy?i:o; tokN=isBuy?o:i;
+    } else return null;
+    if (!isBuy||suiN<=0||tokN<=0) return null;
+    return { suiAmt:suiN/1e9, tokAmt:tokN/10**dec };
+  }
+
+  // ── Fallback: SUI-MIST heuristic (when pool dir fetch fails) ─────────
+  // Works reliably when amounts are clearly different scales
+  if (isSuiRange(i) && !isSuiRange(o)) {
+    // amount_in is SUI scale, amount_out is not → BUY
+    return { suiAmt:i/1e9, tokAmt:o/10**dec };
+  }
+  if (!isSuiRange(i) && isSuiRange(o)) {
+    // amount_out is SUI scale → SELL, skip
+    return null;
+  }
+  // Ambiguous (e.g. mid-price tokens, 6-decimal) → use atob, assume SUI=coinB (most common)
+  if (d.atob !== false) return null;
+  return { suiAmt:i/1e9, tokAmt:o/10**dec };
 }
+
 function parseTurbos(d, dir, dec) {
-  if (!dir) return null;
-  let isBuy, suiN, tokN;
-  if (dir.suiIsB) {
-    isBuy=d.a_to_b===false; suiN=isBuy?+d.amount_b:+d.amount_a; tokN=isBuy?+d.amount_a:+d.amount_b;
-  } else if (dir.suiIsA) {
-    isBuy=d.a_to_b===true;  suiN=isBuy?+d.amount_a:+d.amount_b; tokN=isBuy?+d.amount_b:+d.amount_a;
-  } else return null;
-  if (!isBuy||suiN<=0||tokN<=0) return null;
-  return { suiAmt:suiN/1e9, tokAmt:tokN/10**dec };
+  const a = +d.amount_a, b = +d.amount_b;
+  if (a <= 0 || b <= 0) return null;
+
+  // ── Accurate path ───────────────────────────────────────────────────
+  if (dir) {
+    let isBuy, suiN, tokN;
+    if (dir.suiIsB) {
+      isBuy=d.a_to_b===false; suiN=isBuy?b:a; tokN=isBuy?a:b;
+    } else if (dir.suiIsA) {
+      isBuy=d.a_to_b===true;  suiN=isBuy?a:b; tokN=isBuy?b:a;
+    } else return null;
+    if (!isBuy||suiN<=0||tokN<=0) return null;
+    return { suiAmt:suiN/1e9, tokAmt:tokN/10**dec };
+  }
+
+  // ── Fallback heuristic ──────────────────────────────────────────────
+  if (isSuiRange(a) && !isSuiRange(b)) return { suiAmt:a/1e9, tokAmt:b/10**dec };
+  if (!isSuiRange(a) && isSuiRange(b)) return null; // sell
+  // Ambiguous → use a_to_b, assume SUI=coinA (Turbos convention)
+  if (d.a_to_b !== true) return null;
+  return { suiAmt:a/1e9, tokAmt:b/10**dec };
 }
 function parseBluefin(d, dec) {
   const baseQ  = +(d.base_quantity||d.base_amount||d.quantity||0);
