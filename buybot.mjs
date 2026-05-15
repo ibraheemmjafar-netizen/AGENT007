@@ -1,9 +1,12 @@
 /**
  * ╔══════════════════════════════════════════════════════╗
- * ║           🤖  AGENT BUYBOT  v3.0                   ║
+ * ║           🤖  AGENT BUYBOT  v3.1                   ║
  * ║   Sui Buy Tracker — Cetus · Turbos · Bluefin        ║
  * ╠══════════════════════════════════════════════════════╣
- * ║  FIXES in v3.0:                                     ║
+ * ║  FIXES in v3.1:                                     ║
+ * ║  • Live-only: cursors reset on startup (no replay)  ║
+ * ║  • Correct DEX: pool coin-type matching per token   ║
+ * ║  • Pool fetch: sui_getObject (was suix_getObject)   ║
  * ║  • PRIVACY: each user only sees their own groups    ║
  * ║  • No pool-dir spam: failure cache + concurrency    ║
  * ║  • 409 fix: clean polling restart                   ║
@@ -28,21 +31,20 @@ import { fileURLToPath } from 'url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // ─── PATHS — use DATA_DIR for Railway volume, fallback to local ──────────────
-// In Railway: set DATA_DIR=/data and mount volume at /data
-const DATA_DIR     = process.env.DATA_DIR || __dirname;
-const CONFIG_FILE  = path.join(DATA_DIR, 'config.json');
-const CURSOR_FILE  = path.join(DATA_DIR, 'cursors.json');
-const POOL_FILE    = path.join(DATA_DIR, 'pool_dir.json');
-const META_FILE    = path.join(DATA_DIR, 'coin_meta.json');
+const DATA_DIR    = process.env.DATA_DIR || __dirname;
+const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
+const CURSOR_FILE = path.join(DATA_DIR, 'cursors.json');
+const POOL_FILE   = path.join(DATA_DIR, 'pool_dir.json');
+const META_FILE   = path.join(DATA_DIR, 'coin_meta.json');
 
 // ─── CONSTANTS ───────────────────────────────────────────────────────────────
-const BOT_VERSION   = '3.0.0';
+const BOT_VERSION   = '3.1.0';
 const POLL_MS       = 4_000;
 const PRICE_MS      = 30_000;
-const STATS_MS      = 86_400_000;  // 24 h
-const DEDUP_TTL     = 600_000;     // 10 min
+const STATS_MS      = 86_400_000;
+const DEDUP_TTL     = 600_000;
 const MAX_TOKENS    = 5;
-const POOL_RETRY_MS = 60_000;      // retry failed pool-dir after 60 s
+const POOL_RETRY_MS = 60_000;
 const AGENT_LINK    = 'https://t.me/Sui_Agent/1';
 const SUI_TYPE      = '0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI';
 const SUI_PRICE_URL = 'https://api.coingecko.com/api/v3/simple/price?ids=sui&vs_currencies=usd';
@@ -71,9 +73,12 @@ const S = {
 
 // ─── RUNTIME ─────────────────────────────────────────────────────────────────
 let config   = loadJson(CONFIG_FILE, { version:BOT_VERSION, groups:{} });
-let cursors  = loadJson(CURSOR_FILE, {});
-let poolDir  = loadJson(POOL_FILE,   {});
-let coinMeta = loadJson(META_FILE,   {});
+// FIX: Do NOT load cursors from file — always start fresh at chain tip.
+// Loading old cursors causes the bot to replay all historical transactions
+// since the last restart, spamming the group with old buys.
+let cursors  = {};
+let poolDir  = loadJson(POOL_FILE,  {});
+let coinMeta = loadJson(META_FILE,  {});
 
 let suiPrice  = 1.0;
 let botUser   = 'AgentBuyBot';
@@ -82,14 +87,14 @@ let totalBuys = 0;
 let lastBuyTs = null;
 let activeRpc = null;
 
-const dexInit      = {};          // dexKey -> bool: cursor initialized
-const seenTx       = new Map();   // txKey -> ts
-const seenWallet   = new Map();   // `chatId:wallet` -> true
-const statsMap     = new Map();   // `chatId:addr` -> stats
-const sessions     = new Map();   // userId -> session
-const poolInFlight = new Set();   // pool addresses currently being fetched
-const poolFailed   = new Map();   // pool addr -> failed timestamp
-const dexPriceCache= new Map();   // tokenAddr -> { data, ts }
+const dexInit      = {};
+const seenTx       = new Map();
+const seenWallet   = new Map();
+const statsMap     = new Map();
+const sessions     = new Map();
+const poolInFlight = new Set();
+const poolFailed   = new Map();
+const dexPriceCache= new Map();
 
 // ─── PERSISTENCE ─────────────────────────────────────────────────────────────
 function loadJson(file, def) {
@@ -100,7 +105,6 @@ function loadJson(file, def) {
 }
 function writeJson(file, data) {
   try {
-    // Ensure directory exists (important for Railway volume on first boot)
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, JSON.stringify(data, null, 2));
   } catch(err) { log(`[Write] ${file}: ${err.message}`); }
@@ -129,7 +133,6 @@ function ensureGroup(chatId, name, ownerId) {
 }
 
 // ─── AUTH ─────────────────────────────────────────────────────────────────────
-// Each user only manages groups they own (they added the bot to)
 function myGroups(userId) {
   return Object.entries(config.groups)
     .filter(([, g]) => g.ownerId === String(userId));
@@ -230,31 +233,58 @@ async function dexPriceCached(addr) {
   return data;
 }
 
-// ─── POOL DIRECTION — with failure cache to stop spam ────────────────────────
+// ─── ADDRESS NORMALISATION ────────────────────────────────────────────────────
+// Sui addresses can be short (leading zeros stripped) or full 64-char hex.
+// Normalise to full 64-char lower-case so comparisons are reliable.
+function normSuiAddr(addr) {
+  if (!addr) return '';
+  // Take only the package part (before '::') if a full type string is passed
+  const pkg = addr.split('::')[0].toLowerCase().replace(/^0x/, '');
+  return '0x' + pkg.padStart(64, '0');
+}
+
+// Check whether a tracked token address matches either coin in a pool.
+// coinA / coinB are full type strings like "0xpkg::module::COIN".
+function tokenInPool(tokAddr, coinA, coinB) {
+  if (!tokAddr || (!coinA && !coinB)) return false;
+  const nt = normSuiAddr(tokAddr);
+  return nt === normSuiAddr(coinA) || nt === normSuiAddr(coinB);
+}
+
+// ─── POOL DIRECTION — fetch coin types + SUI side ────────────────────────────
+// Uses sui_getObject (not suix_getObject) — suix variant returns an empty
+// result on many public RPCs, preventing pool-type parsing.
+// Stores { suiIsA, suiIsB, coinA, coinB } so callers can match token addresses.
 async function fetchPoolDir(poolAddr) {
   if (!poolAddr) return null;
   if (poolDir[poolAddr]) return poolDir[poolAddr];
-  // Don't retry a recently failed pool
   const failedAt = poolFailed.get(poolAddr);
   if (failedAt && Date.now()-failedAt < POOL_RETRY_MS) return null;
-  // Don't fire duplicate concurrent fetches for the same pool
   if (poolInFlight.has(poolAddr)) return null;
   poolInFlight.add(poolAddr);
   try {
-    const obj = await rpc('suix_getObject', [poolAddr, {showType:true,showContent:false}]);
-    const typeStr = obj?.data?.type || '';
-    const match = typeStr.match(/<([^,>]+),\s*([^>]+)>/);
+    // Use sui_getObject — it returns the type string directly in result.type.
+    // suix_getObject wraps in result.data.type but returns empty on many RPCs.
+    const obj = await rpc('sui_getObject', [poolAddr, {showType:true, showContent:false}]);
+    // sui_getObject: result = { objectId, version, digest, type, ... }
+    // suix_getObject: result = { data: { objectId, ..., type }, error }
+    const typeStr = obj?.type || obj?.data?.type || '';
+    // Pool type looks like: 0xpkg::pool::Pool<coinA, coinB>
+    // Turbos adds a 3rd fee-type param: Pool<coinA, coinB, FeeType>
+    // Capture only the first two; ignore any 3rd param.
+    const match = typeStr.match(/<([^,>]+),\s*([^,>]+)(?:,\s*[^>]+)?>/);
     if (!match) { poolFailed.set(poolAddr, Date.now()); return null; }
-    const coinA=match[1].trim(), coinB=match[2].trim();
-    const isSui = c => c===SUI_TYPE||c.endsWith('::sui::SUI');
-    const dir = { suiIsA:isSui(coinA), suiIsB:isSui(coinB) };
+    const coinA = match[1].trim();
+    const coinB = match[2].trim();
+    const isSui = c => normSuiAddr(c) === normSuiAddr(SUI_TYPE) || c.endsWith('::sui::SUI');
+    const dir = { suiIsA:isSui(coinA), suiIsB:isSui(coinB), coinA, coinB };
     poolDir[poolAddr] = dir;
-    poolFailed.delete(poolAddr); // clear fail marker
+    poolFailed.delete(poolAddr);
     savePool();
-    log(`Pool ${short(poolAddr)} SUI=${dir.suiIsA?'A':dir.suiIsB?'B':'?'}`);
+    log(`Pool ${short(poolAddr)} coinA=${coinA.split('::').pop()} coinB=${coinB.split('::').pop()} SUI=${dir.suiIsA?'A':dir.suiIsB?'B':'?'}`);
     return dir;
   } catch {
-    poolFailed.set(poolAddr, Date.now()); // mark as failed, wait before retry
+    poolFailed.set(poolAddr, Date.now());
     return null;
   } finally {
     poolInFlight.delete(poolAddr);
@@ -285,14 +315,11 @@ async function fetchCoinMeta(addr) {
 }
 
 // ─── SWAP PARSERS ─────────────────────────────────────────────────────────────
-// SUI trade range: 0.1 SUI (1e8 MIST) to 100,000 SUI (1e14 MIST)
 const isSuiRange = n => n >= 1e8 && n <= 1e14;
 
 function parseCetus(d, dir, dec) {
   const i = +d.amount_in, o = +d.amount_out;
   if (i <= 0 || o <= 0) return null;
-
-  // ── Accurate path: pool direction known ──────────────────────────────
   if (dir) {
     let isBuy, suiN, tokN;
     if (dir.suiIsB) {
@@ -303,18 +330,8 @@ function parseCetus(d, dir, dec) {
     if (!isBuy||suiN<=0||tokN<=0) return null;
     return { suiAmt:suiN/1e9, tokAmt:tokN/10**dec };
   }
-
-  // ── Fallback: SUI-MIST heuristic (when pool dir fetch fails) ─────────
-  // Works reliably when amounts are clearly different scales
-  if (isSuiRange(i) && !isSuiRange(o)) {
-    // amount_in is SUI scale, amount_out is not → BUY
-    return { suiAmt:i/1e9, tokAmt:o/10**dec };
-  }
-  if (!isSuiRange(i) && isSuiRange(o)) {
-    // amount_out is SUI scale → SELL, skip
-    return null;
-  }
-  // Ambiguous (e.g. mid-price tokens, 6-decimal) → use atob, assume SUI=coinB (most common)
+  if (isSuiRange(i) && !isSuiRange(o)) return { suiAmt:i/1e9, tokAmt:o/10**dec };
+  if (!isSuiRange(i) && isSuiRange(o)) return null;
   if (d.atob !== false) return null;
   return { suiAmt:i/1e9, tokAmt:o/10**dec };
 }
@@ -322,8 +339,6 @@ function parseCetus(d, dir, dec) {
 function parseTurbos(d, dir, dec) {
   const a = +d.amount_a, b = +d.amount_b;
   if (a <= 0 || b <= 0) return null;
-
-  // ── Accurate path ───────────────────────────────────────────────────
   if (dir) {
     let isBuy, suiN, tokN;
     if (dir.suiIsB) {
@@ -334,14 +349,12 @@ function parseTurbos(d, dir, dec) {
     if (!isBuy||suiN<=0||tokN<=0) return null;
     return { suiAmt:suiN/1e9, tokAmt:tokN/10**dec };
   }
-
-  // ── Fallback heuristic ──────────────────────────────────────────────
   if (isSuiRange(a) && !isSuiRange(b)) return { suiAmt:a/1e9, tokAmt:b/10**dec };
-  if (!isSuiRange(a) && isSuiRange(b)) return null; // sell
-  // Ambiguous → use a_to_b, assume SUI=coinA (Turbos convention)
+  if (!isSuiRange(a) && isSuiRange(b)) return null;
   if (d.a_to_b !== true) return null;
   return { suiAmt:a/1e9, tokAmt:b/10**dec };
 }
+
 function parseBluefin(d, dec) {
   const baseQ  = +(d.base_quantity||d.base_amount||d.quantity||0);
   const quoteQ = +(d.quote_quantity||d.quote_amount||d.filled_quantity||0);
@@ -350,14 +363,17 @@ function parseBluefin(d, dec) {
 }
 
 // ─── CURSOR INIT — skips history on first launch ─────────────────────────────
+// Fetches the latest event cursor so only NEW transactions are processed.
+// Because cursors are NOT persisted across restarts (see above), this always
+// runs on startup, guaranteeing the bot never replays old transactions.
 async function initCursor(dexKey, eventType) {
-  if (cursors[dexKey] || dexInit[dexKey]) { dexInit[dexKey]=true; return; }
+  if (dexInit[dexKey]) return;
   try {
-    log(`[${dexKey}] Initializing cursor (skipping history)...`);
+    log(`[${dexKey}] Initializing cursor at chain tip (skipping history)...`);
     const r = await rpc('suix_queryEvents', [{MoveEventType:eventType}, null, 1, true]);
     if (r?.nextCursor) { cursors[dexKey]=r.nextCursor; saveCursors(); }
     dexInit[dexKey] = true;
-    log(`[${dexKey}] Live tracking started`);
+    log(`[${dexKey}] Live tracking started from chain tip`);
   } catch(err) { log(`[${dexKey}] Cursor init err: ${err.message}`); dexInit[dexKey]=true; }
 }
 
@@ -370,7 +386,7 @@ const DEXES = [
     async parse(d,pool,dec){ const dir=await fetchPoolDir(pool); return parseTurbos(d,dir,dec); },
     pool: d => d.pool||'' },
   { key:'bluefin', type:BLUEFIN_EVT,
-    async parse(d,_p,dec){ return parseBluefin(d,dec); },
+    async parse(d,pool,dec){ return parseBluefin(d,dec); },
     pool: d => d.market_id||d.pool_id||'' },
 ];
 
@@ -390,10 +406,15 @@ async function poll() {
 
       for (const ev of res.data) {
         const hash = ev.id?.txDigest||''; if (!hash) continue;
+
+        // Safety guard: skip any event that happened before this bot instance started.
+        // This guarantees no old transactions fire even if cursor init returns a
+        // stale cursor or no cursor at all (e.g. Bluefin with no recent activity).
+        if (ev.timestampMs && Number(ev.timestampMs) < startTime) continue;
+
         const txKey = `${dex.key}:${hash}`;
         if (seenTx.has(txKey)) continue;
         seenTx.set(txKey, Date.now());
-        // Prune old dedup entries
         if (seenTx.size > 5000) {
           for (const [k,v] of seenTx) if(Date.now()-v>DEDUP_TTL) seenTx.delete(k);
         }
@@ -402,9 +423,35 @@ async function poll() {
         const pool   = dex.pool(d);
         const wallet = ev.sender||'';
 
+        // FIX: Fetch pool coin types ONCE per pool so we can match tokens.
+        // For Cetus and Turbos, fetchPoolDir now returns { suiIsA, suiIsB, coinA, coinB }.
+        // For Bluefin we rely on event field matching (see below).
+        const dir = (dex.key !== 'bluefin') ? await fetchPoolDir(pool) : null;
+
+        // If pool dir is unknown (still being fetched or failed), skip this
+        // event for non-Bluefin DEXes — we need coin types to match correctly.
+        if (dex.key !== 'bluefin' && !dir) continue;
+
         for (const [chatId, grp] of activeGroups) {
           for (const tok of grp.tokens) {
             if (tok.paused) continue;
+
+            // ── KEY FIX: verify this pool actually involves the tracked token ──
+            // Without this check, any swap on the DEX would fire for every
+            // tracked token, causing wrong-token / wrong-DEX alerts.
+            if (dex.key === 'cetus' || dex.key === 'turbos') {
+              // dir.coinA / dir.coinB are the two coins in the pool.
+              // Skip if the tracked token is not one of them.
+              if (!tokenInPool(tok.address, dir.coinA, dir.coinB)) continue;
+            } else if (dex.key === 'bluefin') {
+              // Bluefin OrderFilled event carries base_asset / quote_asset type fields.
+              // Fall back to address substring match on the raw event JSON string.
+              const evStr = JSON.stringify(d);
+              const normTok = normSuiAddr(tok.address);
+              // Check both the normalized and raw form
+              if (!evStr.includes(tok.address) && !evStr.includes(normTok)) continue;
+            }
+
             const dec    = coinMeta[tok.address]?.decimals ?? tok.decimals ?? 6;
             const parsed = await dex.parse(d, pool, dec);
             if (!parsed||parsed.suiAmt<=0||parsed.tokAmt<=0) continue;
@@ -412,7 +459,6 @@ async function poll() {
             const usdAmt = parsed.suiAmt * suiPrice;
             if (usdAmt < (tok.minBuyUSD||0)) continue;
 
-            // Real price from DexScreener (30s cache)
             const dp    = await dexPriceCached(tok.address);
             const price = dp?.priceUsd || (parsed.tokAmt>0 ? usdAmt/parsed.tokAmt : 0);
             const mcap  = dp?.mcap || (tok.totalSupply&&price ? price*tok.totalSupply : null);
@@ -628,7 +674,6 @@ async function showWallets(uid, chatId, groupId, editId) {
   } catch(err) { log(`[showWallets] ${err.message}`); }
 }
 
-// Preview after token add
 async function sendPreview(chatId, tok, dp) {
   const mockUsd=Math.max(tok.minBuyUSD||0,50);
   const mockSui=(mockUsd/suiPrice).toFixed(4);
@@ -671,7 +716,6 @@ bot.on('my_chat_member', async msg => {
     const chatId  = String(msg.chat.id);
     const name    = msg.chat.title||chatId;
     const ownerId = String(msg.from.id);
-    // Only create/update group if we are added (not promoted/demoted)
     if (!config.groups[chatId]) {
       config.groups[chatId] = mkGroup(name, ownerId);
       save();
@@ -680,11 +724,9 @@ bot.on('my_chat_member', async msg => {
     const btn = { reply_markup:{ inline_keyboard:[[{text:'⚙️ Set Up in DM', url:`https://t.me/${botUser}?start=g_${chatId}`}]] }};
     await bot.sendMessage(chatId,
       `🤖 AGENT BUYBOT has arrived!\n\nTap below to set me up. Everything is configured in DM — no commands needed here!\n\n1️⃣ Make sure I'm an admin\n2️⃣ Tap the button below\n3️⃣ Pick this group and add your token`, btn);
-    await bot.sendMessage(chatId, `🤖 AGENT BUYBOT is active!\n\nTap below to set me up in DM.`, btn);
   } catch(err) { log(`[my_chat_member] ${err.message}`); }
 });
 
-// Also keep new_chat_members as fallback
 bot.on('new_chat_members', async msg => {
   try {
     const me = await bot.getMe();
@@ -700,7 +742,6 @@ bot.on('new_chat_members', async msg => {
     const btn = { reply_markup:{ inline_keyboard:[[{text:'⚙️ Set Up in DM', url:`https://t.me/${botUser}?start=g_${chatId}`}]] }};
     await bot.sendMessage(chatId,
       `🤖 AGENT BUYBOT has arrived!\n\nTap below to set me up. Everything is configured in DM — no commands needed here!\n\n1️⃣ Make sure I'm an admin\n2️⃣ Tap the button below\n3️⃣ Pick this group and add your token`, btn);
-    await bot.sendMessage(chatId, `🤖 AGENT BUYBOT is active!\n\nTap below to set me up in DM.`, btn);
   } catch(err) { log(`[new_chat_members] ${err.message}`); }
 });
 
@@ -712,14 +753,12 @@ bot.onText(/^\/start(?:\s+(.+))?$/, async (msg, match) => {
     return bot.sendMessage(chatId, '🤖 AGENT BUYBOT is active!\n\nTap below to set me up in DM.',
       {reply_markup:{inline_keyboard:[[{text:'⚙️ Set Up in DM',url:`https://t.me/${botUser}?start=g_${chatId}`}]]}});
   }
-  // Deep link from group "Set Up in DM" button
   if (param.startsWith('g_')) {
     const gid = param.slice(2);
     if (config.groups[gid] && canManage(uid, gid)) {
       clrSess(uid); setSess(uid,{groupId:gid});
       return showTokenList(uid, chatId, gid, null);
     }
-    // Group exists but this user isn't owner — add them as owner if no owner set yet
     if (config.groups[gid] && !config.groups[gid].ownerId) {
       config.groups[gid].ownerId = uid; save();
       clrSess(uid); setSess(uid,{groupId:gid});
@@ -871,7 +910,6 @@ bot.on('callback_query', async query => {
     return showGroups(uid,chatId,msgId);
   }
 
-  // Token settings: ts:field:chatId:idx
   if (data.startsWith('ts:')) {
     const parts=data.split(':'), field=parts[1], gid=parts[2], idx=parseInt(parts[3]);
     if (!canManage(uid,gid)) return;
@@ -922,7 +960,6 @@ bot.on('message', async msg => {
   };
   const bad = (txt, tag) => bot.sendMessage(chatId,txt,{reply_markup:kbCancel(tag)});
 
-  // ── Add token
   if (state===S.TOKEN) {
     const addr=text.replace(/\s+/g,'');
     if (!addr.startsWith('0x')||!addr.includes('::'))
@@ -1016,10 +1053,7 @@ async function main() {
   botUser = me.username;
   log(`✅ @${botUser}`);
 
-  // Start polling — dropPendingUpdates clears any stale session from previous instance
-  // This fixes the 409 Conflict error from overlapping Railway deployments
   await bot.startPolling({ restart:false, polling:{ params:{ timeout:10, allowed_updates:['message','callback_query','my_chat_member','chat_member'] } } });
-  // Clear pending updates to avoid 409 with old instance
   try { await bot.deleteWebhook({drop_pending_updates:true}); } catch {}
 
   await refreshSuiPrice();
@@ -1031,4 +1065,4 @@ async function main() {
   log('✅ Ready. Each user manages only their own groups.');
 }
 
-main().catch(console.error);
+main().catch(err => { console.error('Fatal:', err); process.exit(1); });
