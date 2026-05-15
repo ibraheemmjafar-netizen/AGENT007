@@ -1,15 +1,21 @@
 /**
  * ╔══════════════════════════════════════════════════════╗
- * ║           🤖  AGENT BUYBOT  v3.1                   ║
+ * ║           🤖  AGENT BUYBOT  v3.2                   ║
  * ║   Sui Buy Tracker — Cetus · Turbos · Bluefin        ║
  * ╠══════════════════════════════════════════════════════╣
  * ║  FIXES in v3.1:                                     ║
  * ║  • Live-only: cursors reset on startup (no replay)  ║
  * ║  • Correct DEX: pool coin-type matching per token   ║
  * ║  • Pool fetch: sui_getObject (was suix_getObject)   ║
+ * ║  • Turbos 3-param generic type regex                ║
+ * ║  FIXES in v3.2:                                     ║
+ * ║  • Bluefin: use fetchPoolDir (was fragile JSON str) ║
+ * ║  • Bluefin: parseBluefin uses dir to find SUI side  ║
+ * ║    (base=coinA=token, quote=coinB=SUI — was swapped)║
+ * ║  • Bluefin: token matching unified with Cetus/Turbos║
+ * ║  FEATURES:                                          ║
  * ║  • PRIVACY: each user only sees their own groups    ║
  * ║  • No pool-dir spam: failure cache + concurrency    ║
- * ║  • 409 fix: clean polling restart                   ║
  * ║  • Railway volume: DATA_DIR env for persistence     ║
  * ║  • Multi-token per group (up to 5)                  ║
  * ║  • DexScreener real price + MCap                    ║
@@ -38,7 +44,7 @@ const POOL_FILE   = path.join(DATA_DIR, 'pool_dir.json');
 const META_FILE   = path.join(DATA_DIR, 'coin_meta.json');
 
 // ─── CONSTANTS ───────────────────────────────────────────────────────────────
-const BOT_VERSION   = '3.1.0';
+const BOT_VERSION   = '3.2.0';
 const POLL_MS       = 4_000;
 const PRICE_MS      = 30_000;
 const STATS_MS      = 86_400_000;
@@ -355,11 +361,33 @@ function parseTurbos(d, dir, dec) {
   return { suiAmt:a/1e9, tokAmt:b/10**dec };
 }
 
-function parseBluefin(d, dec) {
+function parseBluefin(d, dir, dec) {
+  // Bluefin OrderFilled: base = coinA (the token), quote = coinB (SUI or stablecoin)
+  // For a MANIFEST/SUI pool: base=MANIFEST(9dec), quote=SUI(9dec)
   const baseQ  = +(d.base_quantity||d.base_amount||d.quantity||0);
   const quoteQ = +(d.quote_quantity||d.quote_amount||d.filled_quantity||0);
   if (baseQ<=0||quoteQ<=0) return null;
-  return { suiAmt:baseQ/1e9, tokAmt:quoteQ/10**dec };
+
+  if (dir) {
+    // Use pool direction to know which side is SUI and which is the token
+    // Bluefin convention: base asset = coinA, quote asset = coinB
+    let suiRaw, tokRaw;
+    if (dir.suiIsB) {
+      // SUI is coinB = quote side
+      suiRaw = quoteQ; tokRaw = baseQ;
+    } else if (dir.suiIsA) {
+      // SUI is coinA = base side
+      suiRaw = baseQ;  tokRaw = quoteQ;
+    } else {
+      // Neither side is SUI (e.g. TOKEN/USDC pair) — skip
+      return null;
+    }
+    if (suiRaw<=0||tokRaw<=0) return null;
+    return { suiAmt:suiRaw/1e9, tokAmt:tokRaw/10**dec };
+  }
+
+  // Fallback (pool dir unavailable): assume base=token, quote=SUI — most common for X/SUI pairs
+  return { suiAmt:quoteQ/1e9, tokAmt:baseQ/10**dec };
 }
 
 // ─── CURSOR INIT — skips history on first launch ─────────────────────────────
@@ -386,7 +414,9 @@ const DEXES = [
     async parse(d,pool,dec){ const dir=await fetchPoolDir(pool); return parseTurbos(d,dir,dec); },
     pool: d => d.pool||'' },
   { key:'bluefin', type:BLUEFIN_EVT,
-    async parse(d,pool,dec){ return parseBluefin(d,dec); },
+    // Pass pool dir to parseBluefin so it can correctly identify which side is SUI.
+    // Bluefin convention: base=coinA (token), quote=coinB (SUI/stablecoin).
+    async parse(d,pool,dec){ const dir=await fetchPoolDir(pool); return parseBluefin(d,dir,dec); },
     pool: d => d.market_id||d.pool_id||'' },
 ];
 
@@ -423,34 +453,25 @@ async function poll() {
         const pool   = dex.pool(d);
         const wallet = ev.sender||'';
 
-        // FIX: Fetch pool coin types ONCE per pool so we can match tokens.
-        // For Cetus and Turbos, fetchPoolDir now returns { suiIsA, suiIsB, coinA, coinB }.
-        // For Bluefin we rely on event field matching (see below).
-        const dir = (dex.key !== 'bluefin') ? await fetchPoolDir(pool) : null;
+        // Fetch pool coin types for all DEXes (Cetus, Turbos, and Bluefin).
+        // fetchPoolDir returns { suiIsA, suiIsB, coinA, coinB } so we can:
+        //   1. verify the tracked token is actually in this pool
+        //   2. correctly identify the SUI side when parsing amounts
+        const dir = await fetchPoolDir(pool);
 
-        // If pool dir is unknown (still being fetched or failed), skip this
-        // event for non-Bluefin DEXes — we need coin types to match correctly.
-        if (dex.key !== 'bluefin' && !dir) continue;
+        // If pool dir is unknown (fetch failed or still in-flight), skip this event.
+        // We must not fire alerts without knowing the pool's coin types — otherwise
+        // any swap on any pool would trigger for every tracked token.
+        if (!dir) continue;
 
         for (const [chatId, grp] of activeGroups) {
           for (const tok of grp.tokens) {
             if (tok.paused) continue;
 
-            // ── KEY FIX: verify this pool actually involves the tracked token ──
-            // Without this check, any swap on the DEX would fire for every
-            // tracked token, causing wrong-token / wrong-DEX alerts.
-            if (dex.key === 'cetus' || dex.key === 'turbos') {
-              // dir.coinA / dir.coinB are the two coins in the pool.
-              // Skip if the tracked token is not one of them.
-              if (!tokenInPool(tok.address, dir.coinA, dir.coinB)) continue;
-            } else if (dex.key === 'bluefin') {
-              // Bluefin OrderFilled event carries base_asset / quote_asset type fields.
-              // Fall back to address substring match on the raw event JSON string.
-              const evStr = JSON.stringify(d);
-              const normTok = normSuiAddr(tok.address);
-              // Check both the normalized and raw form
-              if (!evStr.includes(tok.address) && !evStr.includes(normTok)) continue;
-            }
+            // ── KEY CHECK: verify this pool actually involves the tracked token ──
+            // dir.coinA / dir.coinB are the two coins in the pool.
+            // Skip if the tracked token is not one of them.
+            if (!tokenInPool(tok.address, dir.coinA, dir.coinB)) continue;
 
             const dec    = coinMeta[tok.address]?.decimals ?? tok.decimals ?? 6;
             const parsed = await dex.parse(d, pool, dec);
